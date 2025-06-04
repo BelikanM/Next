@@ -1,0 +1,30 @@
+.notfound {
+  padding: 2rem 0;
+  min-height: calc(100vh - 140px);
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+.notfound h1 {
+  font-size: 2.5rem;
+  color: #333;
+  margin-bottom: 1rem;
+  text-align: center;
+}
+
+.notfound p {
+  font-size: 1.1rem;
+  color: #666;
+  line-height: 1.6;
+  text-align: center;
+}
+
+@media (max-width: 768px) {
+  .notfound h1 {
+    font-size: 2rem;
+  }
+}

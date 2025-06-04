@@ -1,22 +1,25 @@
 {
-  "name": "netflix-pwa",
+  "name": "modern-react-app",
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "appwrite": "^18.1.1",
-    "dotenv": "^16.5.0",
-    "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "react-helmet-async": "^2.0.5",
-    "react-icons": "^5.5.0",
-    "react-router-dom": "^6.8.1",
-    "react-scripts": "5.0.1"
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.8.0",
+    "react-scripts": "5.0.1",
+    "lucide-react": "^0.263.1"
   },
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",
     "test": "react-scripts test",
     "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
   },
   "browserslist": {
     "production": [
