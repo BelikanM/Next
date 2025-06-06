@@ -3,7 +3,7 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 
 import FootNav from './components/FootNav';
-
+import './App.css';
 // Import pages
 import Home from './pages/Home';
 import About from './pages/About';
