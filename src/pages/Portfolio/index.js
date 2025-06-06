@@ -11,6 +11,8 @@ const storage = new Storage(client);
 
 const DATABASE_ID = "tiktok_db";
 const MUSIC_COLLECTION_ID = "music";
+const USERS_COLLECTION_ID = "users"; // Collection pour les profils utilisateurs
+const SUBSCRIPTIONS_COLLECTION_ID = "subscriptions";
 const BUCKET_ID = "6827864200044d72309a";
 
 const SpotifyApp = () => {
@@ -57,6 +59,32 @@ const SpotifyApp = () => {
   const [isScrolled, setIsScrolled] = useState(false);
   const [activeSection, setActiveSection] = useState("library");
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  
+  // États pour les artistes et abonnements - MODIFIÉS
+  const [artists, setArtists] = useState([]); // Tous les utilisateurs qui ont publié
+  const [subscriptions, setSubscriptions] = useState([]);
+  const [searchArtistQuery, setSearchArtistQuery] = useState("");
+  const [userProfile, setUserProfile] = useState(null); // Profil utilisateur complet
+  
+  // États pour le profil
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [profileData, setProfileData] = useState({
+    name: "",
+    bio: "",
+    location: "",
+    website: "",
+    socialLinks: {
+      instagram: "",
+      twitter: "",
+      youtube: "",
+      spotify: ""
+    },
+    isArtist: true, // Nouveau champ
+    artistName: "",
+    genre: ""
+  });
+  const [profileImage, setProfileImage] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
   
   const audioRef = useRef(null);
   const mainContentRef = useRef(null);
@@ -134,11 +162,102 @@ const SpotifyApp = () => {
     }
   };
 
+  // NOUVELLE FONCTION : Créer ou mettre à jour le profil utilisateur
+  const createOrUpdateUserProfile = async (userData) => {
+    try {
+      // Vérifier si le profil existe déjà
+      let existingProfile = null;
+      try {
+        const profiles = await databases.listDocuments(
+          DATABASE_ID,
+          USERS_COLLECTION_ID,
+          [Query.equal("userId", userData.$id)]
+        );
+        existingProfile = profiles.documents[0];
+      } catch (err) {
+        console.log("Aucun profil existant trouvé");
+      }
+
+      const profileData = {
+        userId: userData.$id,
+        name: userData.name,
+        email: userData.email,
+        avatar: userData.prefs?.avatar || `https://ui-avatars.com/api/?name=${userData.name}&background=10b981&color=fff`,
+        bio: userData.prefs?.bio || "",
+        location: userData.prefs?.location || "",
+        website: userData.prefs?.website || "",
+        socialLinks: userData.prefs?.socialLinks || {
+          instagram: "",
+          twitter: "",
+          youtube: "",
+          spotify: ""
+        },
+        isArtist: userData.prefs?.isArtist !== false, // Par défaut true
+        artistName: userData.prefs?.artistName || userData.name,
+        genre: userData.prefs?.genre || "",
+        tracksCount: 0,
+        followersCount: 0,
+        totalPlays: 0,
+        joinedAt: new Date().toISOString()
+      };
+
+      if (existingProfile) {
+        // Mettre à jour le profil existant
+        const updatedProfile = await databases.updateDocument(
+          DATABASE_ID,
+          USERS_COLLECTION_ID,
+          existingProfile.$id,
+          {
+            ...profileData,
+            tracksCount: existingProfile.tracksCount || 0,
+            followersCount: existingProfile.followersCount || 0,
+            totalPlays: existingProfile.totalPlays || 0,
+            joinedAt: existingProfile.joinedAt || new Date().toISOString()
+          }
+        );
+        setUserProfile(updatedProfile);
+      } else {
+        // Créer un nouveau profil
+        const newProfile = await databases.createDocument(
+          DATABASE_ID,
+          USERS_COLLECTION_ID,
+          ID.unique(),
+          profileData
+        );
+        setUserProfile(newProfile);
+      }
+    } catch (err) {
+      console.error("Erreur création/mise à jour profil:", err);
+    }
+  };
+
   const fetchUser = async () => {
     try {
-      const user = await account.get();
-      setUser(user);
+      const userData = await account.get();
+      setUser(userData);
+      
+      // Créer ou mettre à jour le profil utilisateur
+      await createOrUpdateUserProfile(userData);
+      
+      setProfileData({
+        name: userData.name || "",
+        bio: userData.prefs?.bio || "",
+        location: userData.prefs?.location || "",
+        website: userData.prefs?.website || "",
+        socialLinks: userData.prefs?.socialLinks || {
+          instagram: "",
+          twitter: "",
+          youtube: "",
+          spotify: ""
+        },
+        isArtist: userData.prefs?.isArtist !== false,
+        artistName: userData.prefs?.artistName || userData.name,
+        genre: userData.prefs?.genre || ""
+      });
+      
       fetchTracks();
+      fetchArtists();
+      fetchSubscriptions();
     } catch (err) {
       console.error("Erreur récupération utilisateur:", err);
       setUser(null);
@@ -178,6 +297,218 @@ const SpotifyApp = () => {
     }
   };
 
+  // NOUVELLE FONCTION : Récupération des artistes (utilisateurs qui ont publié)
+  const fetchArtists = async () => {
+    try {
+      const queries = [];
+      
+      if (searchArtistQuery.trim()) {
+        queries.push(Query.search("name", searchArtistQuery));
+      }
+      
+      // Récupérer tous les profils utilisateurs
+      const res = await databases.listDocuments(
+        DATABASE_ID, 
+        USERS_COLLECTION_ID,
+        [
+          ...queries,
+          Query.orderDesc("$createdAt"),
+          Query.limit(100)
+        ]
+      );
+      
+      // Calculer les statistiques pour chaque artiste
+      const artistsWithStats = await Promise.all(
+        res.documents.map(async (artist) => {
+          try {
+            // Compter les musiques de cet artiste
+            const tracksRes = await databases.listDocuments(
+              DATABASE_ID,
+              MUSIC_COLLECTION_ID,
+              [
+                Query.equal("uploadedBy", artist.userId),
+                Query.limit(1000)
+              ]
+            );
+            
+            // Calculer le total des lectures
+            const totalPlays = tracksRes.documents.reduce(
+              (sum, track) => sum + (track.playsCount || 0), 0
+            );
+            
+            // Compter les abonnés
+            const followersRes = await databases.listDocuments(
+              DATABASE_ID,
+              SUBSCRIPTIONS_COLLECTION_ID,
+              [
+                Query.equal("artistId", artist.userId),
+                Query.limit(1000)
+              ]
+            );
+            
+            return {
+              ...artist,
+              tracksCount: tracksRes.documents.length,
+              totalPlays: totalPlays,
+              followersCount: followersRes.documents.length,
+              tracks: tracksRes.documents
+            };
+          } catch (err) {
+            console.error(`Erreur stats pour ${artist.name}:`, err);
+            return {
+              ...artist,
+              tracksCount: 0,
+              totalPlays: 0,
+              followersCount: 0,
+              tracks: []
+            };
+          }
+        })
+      );
+      
+      // Filtrer pour ne montrer que les artistes qui ont publié au moins une musique
+      // OU inclure l'utilisateur actuel même s'il n'a pas encore publié
+      const filteredArtists = artistsWithStats.filter(artist => 
+        artist.tracksCount > 0 || (user && artist.userId === user.$id)
+      );
+      
+      setArtists(filteredArtists);
+    } catch (err) {
+      console.error("Erreur récupération artistes:", err);
+      setArtists([]);
+    }
+  };
+
+  // Récupération des abonnements
+  const fetchSubscriptions = async () => {
+    if (!user) return;
+    
+    try {
+      const res = await databases.listDocuments(
+        DATABASE_ID, 
+        SUBSCRIPTIONS_COLLECTION_ID,
+        [
+          Query.equal("userId", user.$id),
+          Query.limit(100)
+        ]
+      );
+      
+      setSubscriptions(res.documents);
+    } catch (err) {
+      console.error("Erreur récupération abonnements:", err);
+      setSubscriptions([]);
+    }
+  };
+
+  // S'abonner à un artiste - MODIFIÉ
+  const subscribeToArtist = async (artistUserId) => {
+    if (!user) return;
+    
+    // Empêcher de s'abonner à soi-même
+    if (artistUserId === user.$id) {
+      alert("❌ Vous ne pouvez pas vous abonner à vous-même !");
+      return;
+    }
+    
+    try {
+      await databases.createDocument(
+        DATABASE_ID,
+        SUBSCRIPTIONS_COLLECTION_ID,
+        ID.unique(),
+        {
+          userId: user.$id,
+          artistId: artistUserId,
+          subscribedAt: new Date().toISOString()
+        }
+      );
+      
+      fetchSubscriptions();
+      fetchArtists(); // Rafraîchir pour mettre à jour le compteur
+      alert("✅ Abonnement réussi !");
+    } catch (err) {
+      console.error("Erreur abonnement:", err);
+      alert("❌ Erreur lors de l'abonnement");
+    }
+  };
+
+  // Se désabonner d'un artiste - MODIFIÉ
+  const unsubscribeFromArtist = async (artistUserId) => {
+    if (!user) return;
+    
+    try {
+      const subscription = subscriptions.find(sub => sub.artistId === artistUserId);
+      if (subscription) {
+        await databases.deleteDocument(
+          DATABASE_ID,
+          SUBSCRIPTIONS_COLLECTION_ID,
+          subscription.$id
+        );
+        
+        fetchSubscriptions();
+        fetchArtists(); // Rafraîchir pour mettre à jour le compteur
+        alert("✅ Désabonnement réussi !");
+      }
+    } catch (err) {
+      console.error("Erreur désabonnement:", err);
+      alert("❌ Erreur lors du désabonnement");
+    }
+  };
+
+  // Vérifier si l'utilisateur est abonné à un artiste - MODIFIÉ
+  const isSubscribedToArtist = (artistUserId) => {
+    return subscriptions.some(sub => sub.artistId === artistUserId);
+  };
+
+  // Mise à jour du profil - MODIFIÉE
+  const updateProfile = async (e) => {
+    e.preventDefault();
+    setProfileLoading(true);
+    
+    try {
+      let profileImageUrl = user.prefs?.avatar || "";
+      
+      // Upload de la nouvelle image de profil si sélectionnée
+      if (profileImage) {
+        const uploadedImage = await storage.createFile(
+          BUCKET_ID, 
+          ID.unique(), 
+          profileImage
+        );
+        profileImageUrl = storage.getFileView(BUCKET_ID, uploadedImage.$id);
+      }
+      
+      // Mise à jour des préférences utilisateur
+      await account.updatePrefs({
+        ...user.prefs,
+        bio: profileData.bio,
+        location: profileData.location,
+        website: profileData.website,
+        socialLinks: profileData.socialLinks,
+        avatar: profileImageUrl,
+        isArtist: profileData.isArtist,
+        artistName: profileData.artistName,
+        genre: profileData.genre
+      });
+      
+      // Mise à jour du nom si changé
+      if (profileData.name !== user.name) {
+        await account.updateName(profileData.name);
+      }
+      
+      // Rafraîchir les données utilisateur
+      await fetchUser();
+      setShowProfileModal(false);
+      setProfileImage(null);
+      alert("✅ Profil mis à jour avec succès !");
+      
+    } catch (err) {
+      console.error("Erreur mise à jour profil:", err);
+      alert("❌ Erreur lors de la mise à jour du profil");
+    } finally {
+      setProfileLoading(false);
+    }
+  };
+
   // Gestion du formulaire
   const handleInputChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -185,6 +516,27 @@ const SpotifyApp = () => {
       ...prev,
       [name]: type === 'checkbox' ? checked : value
     }));
+  };
+
+  // Gestion du formulaire de profil - MODIFIÉE
+  const handleProfileInputChange = (e) => {
+    const { name, value, type, checked } = e.target;
+    
+    if (name.startsWith('social.')) {
+      const socialField = name.split('.')[1];
+      setProfileData(prev => ({
+        ...prev,
+        socialLinks: {
+          ...prev.socialLinks,
+          [socialField]: value
+        }
+      }));
+    } else {
+      setProfileData(prev => ({
+        ...prev,
+        [name]: type === 'checkbox' ? checked : value
+      }));
+    }
   };
 
   // Calculer la durée du fichier audio
@@ -257,7 +609,7 @@ const SpotifyApp = () => {
     }
   };
 
-  // Upload de musique avec gestion d'erreurs améliorée
+  // Upload de musique avec gestion d'erreurs améliorée - MODIFIÉE
   const handleSubmit = async (e) => {
     e.preventDefault();
     
@@ -375,6 +727,7 @@ const SpotifyApp = () => {
       
       // Actualiser la liste et naviguer vers la bibliothèque
       await fetchTracks();
+      await fetchArtists(); // Rafraîchir les artistes pour mettre à jour les stats
       scrollToSection("library");
       alert("🎵 Musique ajoutée avec succès !");
 
@@ -440,10 +793,14 @@ const SpotifyApp = () => {
 
   // Fonction sécurisée pour changer le temps de lecture
   const seekToTime = (newTime) => {
-    if (audioRef.current && duration && !isNaN(newTime) && isFinite(newTime)) {
+    if (audioRef.current && duration && !isNaN(newTime) && isFinite(newTime) && newTime >= 0) {
       const clampedTime = Math.max(0, Math.min(newTime, duration));
-      audioRef.current.currentTime = clampedTime;
-      setCurrentTime(clampedTime);
+      try {
+        audioRef.current.currentTime = clampedTime;
+        setCurrentTime(clampedTime);
+      } catch (error) {
+        console.error("Erreur lors du changement de position:", error);
+      }
     }
   };
 
@@ -469,6 +826,7 @@ const SpotifyApp = () => {
       try {
         await databases.deleteDocument(DATABASE_ID, MUSIC_COLLECTION_ID, trackId);
         fetchTracks();
+        fetchArtists(); // Rafraîchir les artistes pour mettre à jour les stats
         if (currentTrack?.$id === trackId) {
           setCurrentTrack(null);
           setIsPlaying(false);
@@ -505,6 +863,12 @@ const SpotifyApp = () => {
       fetchTracks();
     }
   }, [searchQuery, selectedGenre, sortBy, user]);
+
+  useEffect(() => {
+    if (user) {
+      fetchArtists();
+    }
+  }, [searchArtistQuery, user]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -631,6 +995,7 @@ const SpotifyApp = () => {
               {[
                 { id: "library", icon: "🎵", label: "Bibliothèque", count: tracks.length },
                 { id: "upload", icon: "⬆️", label: "Ajouter" },
+                { id: "artists", icon: "👥", label: "Artistes", count: artists.length },
                 { id: "stats", icon: "📊", label: "Stats" }
               ].map((tab) => (
                 <button
@@ -677,6 +1042,7 @@ const SpotifyApp = () => {
                 src={user.prefs?.avatar || `https://ui-avatars.com/api/?name=${user.name}&background=10b981&color=fff`}
                 alt="Avatar"
                 style={styles.avatar}
+                onClick={() => setShowProfileModal(true)}
               />
               <div style={styles.avatarStatus}></div>
             </div>
@@ -705,6 +1071,7 @@ const SpotifyApp = () => {
             {[
               { id: "library", icon: "🎵", label: "Bibliothèque", count: tracks.length },
               { id: "upload", icon: "⬆️", label: "Ajouter" },
+              { id: "artists", icon: "👥", label: "Artistes", count: artists.length },
               { id: "stats", icon: "📊", label: "Stats" }
             ].map((tab) => (
               <button
@@ -733,8 +1100,8 @@ const SpotifyApp = () => {
         ref={mainContentRef}
         style={{
           ...styles.mainContent,
-          paddingTop: isMobile ? '8rem' : '5rem', // Ajustement du padding
-          paddingBottom: currentTrack ? '10rem' : '2rem' // Plus d'espace si lecteur actif
+          paddingTop: isMobile ? '9rem' : '6rem',
+          paddingBottom: currentTrack ? '12rem' : '3rem'
         }}
       >
         <div style={styles.contentContainer}>
@@ -1298,6 +1665,355 @@ const SpotifyApp = () => {
             </div>
           )}
 
+          {/* Section Artistes - AMÉLIORÉE */}
+          {activeTab === "artists" && (
+            <div style={styles.section}>
+              {/* En-tête de section */}
+              <div style={styles.sectionHeader}>
+                <h2 style={styles.sectionTitle}>
+                  Découvrir les Artistes
+                </h2>
+                <p style={styles.sectionSubtitle}>
+                  Trouvez et suivez vos artistes préférés de la communauté
+                </p>
+              </div>
+
+              {/* Barre de recherche d'artistes */}
+              <div style={styles.filtersContainer}>
+                <div style={styles.searchContainer}>
+                  <div style={styles.searchIcon}>🔍</div>
+                  <input
+                    type="text"
+                    value={searchArtistQuery}
+                    onChange={(e) => setSearchArtistQuery(e.target.value)}
+                    placeholder="Rechercher un artiste..."
+                    style={styles.input}
+                  />
+                </div>
+              </div>
+
+              {/* Mon profil d'artiste - NOUVEAU */}
+              {userProfile && (
+                <div style={styles.myProfileSection}>
+                  <h3 style={styles.subsectionTitle}>
+                    <span style={styles.subsectionIcon}>👤</span>
+                    Mon Profil d'Artiste
+                  </h3>
+                  <div style={styles.myProfileCard}>
+                    <div style={styles.artistHeader}>
+                      <div style={styles.artistAvatar}>
+                        <img 
+                          src={userProfile.avatar} 
+                          alt={userProfile.name} 
+                          style={styles.artistAvatarImage} 
+                        />
+                      </div>
+                      <div style={styles.myProfileBadge}>
+                        <span>🎤</span>
+                        <span>C'est vous !</span>
+                      </div>
+                    </div>
+                    
+                    <div style={styles.artistInfo}>
+                      <h4 style={styles.artistName}>{userProfile.artistName || userProfile.name}</h4>
+                      <p style={styles.artistGenre}>{userProfile.genre || "Artiste"}</p>
+                      {userProfile.bio && (
+                        <p style={styles.artistBio}>{userProfile.bio}</p>
+                      )}
+                      {userProfile.location && (
+                        <p style={styles.artistLocation}>
+                          <span>📍</span>
+                          <span>{userProfile.location}</span>
+                        </p>
+                      )}
+                    </div>
+
+                    <div style={styles.artistStats}>
+                      <div style={styles.artistStat}>
+                        <span style={styles.artistStatValue}>
+                          {tracks.filter(track => track.uploadedBy === user.$id).length}
+                        </span>
+                        <span style={styles.artistStatLabel}>Titres</span>
+                      </div>
+                      <div style={styles.artistStat}>
+                        <span style={styles.artistStatValue}>
+                          {artists.find(artist => artist.userId === user.$id)?.followersCount || 0}
+                        </span>
+                        <span style={styles.artistStatLabel}>Abonnés</span>
+                      </div>
+                      <div style={styles.artistStat}>
+                        <span style={styles.artistStatValue}>
+                          {tracks
+                            .filter(track => track.uploadedBy === user.$id)
+                            .reduce((sum, track) => sum + (track.playsCount || 0), 0)
+                          }
+                        </span>
+                        <span style={styles.artistStatLabel}>Lectures</span>
+                      </div>
+                    </div>
+
+                    {/* Liens sociaux */}
+                    {userProfile.socialLinks && Object.values(userProfile.socialLinks).some(link => link) && (
+                      <div style={styles.artistSocial}>
+                        {userProfile.socialLinks.spotify && (
+                          <a href={userProfile.socialLinks.spotify} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                            🎵
+                          </a>
+                        )}
+                        {userProfile.socialLinks.instagram && (
+                          <a href={userProfile.socialLinks.instagram} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                            📷
+                          </a>
+                        )}
+                        {userProfile.socialLinks.twitter && (
+                          <a href={userProfile.socialLinks.twitter} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                            🐦
+                          </a>
+                        )}
+                        {userProfile.socialLinks.youtube && (
+                          <a href={userProfile.socialLinks.youtube} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                            📺
+                          </a>
+                        )}
+                      </div>
+                    )}
+
+                    <div style={styles.artistActions}>
+                      <button
+                        onClick={() => setShowProfileModal(true)}
+                        style={styles.editProfileButton}
+                      >
+                        <span>✏️</span>
+                        <span>Modifier mon profil</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Mes abonnements */}
+              {subscriptions.length > 0 && (
+                <div style={styles.subscriptionsSection}>
+                  <h3 style={styles.subsectionTitle}>
+                    <span style={styles.subsectionIcon}>⭐</span>
+                    Mes Abonnements ({subscriptions.length})
+                  </h3>
+                  <div style={styles.artistsGrid}>
+                    {artists
+                      .filter(artist => isSubscribedToArtist(artist.userId) && artist.userId !== user.$id)
+                      .map((artist) => (
+                        <div key={artist.$id} style={styles.artistCard} className="artist-card">
+                          <div style={styles.artistHeader}>
+                            <div style={styles.artistAvatar}>
+                              <img src={artist.avatar} alt={artist.name} style={styles.artistAvatarImage} />
+                            </div>
+                            <div style={styles.subscribedBadge}>
+                              <span>⭐</span>
+                              <span>Abonné</span>
+                            </div>
+                          </div>
+                          
+                          <div style={styles.artistInfo}>
+                            <h4 style={styles.artistName}>{artist.artistName || artist.name}</h4>
+                            <p style={styles.artistGenre}>{artist.genre || "Artiste"}</p>
+                            {artist.bio && (
+                              <p style={styles.artistBio}>{artist.bio}</p>
+                            )}
+                            {artist.location && (
+                              <p style={styles.artistLocation}>
+                                <span>📍</span>
+                                <span>{artist.location}</span>
+                              </p>
+                            )}
+                          </div>
+
+                          <div style={styles.artistStats}>
+                            <div style={styles.artistStat}>
+                              <span style={styles.artistStatValue}>{artist.tracksCount}</span>
+                              <span style={styles.artistStatLabel}>Titres</span>
+                            </div>
+                            <div style={styles.artistStat}>
+                              <span style={styles.artistStatValue}>{artist.followersCount}</span>
+                              <span style={styles.artistStatLabel}>Abonnés</span>
+                            </div>
+                            <div style={styles.artistStat}>
+                              <span style={styles.artistStatValue}>{artist.totalPlays}</span>
+                              <span style={styles.artistStatLabel}>Lectures</span>
+                            </div>
+                          </div>
+
+                          {/* Liens sociaux */}
+                          {artist.socialLinks && Object.values(artist.socialLinks).some(link => link) && (
+                            <div style={styles.artistSocial}>
+                              {artist.socialLinks.spotify && (
+                                <a href={artist.socialLinks.spotify} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                                  🎵
+                                </a>
+                              )}
+                              {artist.socialLinks.instagram && (
+                                <a href={artist.socialLinks.instagram} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                                  📷
+                                </a>
+                              )}
+                              {artist.socialLinks.twitter && (
+                                <a href={artist.socialLinks.twitter} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                                  🐦
+                                </a>
+                              )}
+                              {artist.socialLinks.youtube && (
+                                <a href={artist.socialLinks.youtube} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                                  📺
+                                </a>
+                              )}
+                            </div>
+                          )}
+
+                          <div style={styles.artistActions}>
+                            <button
+                              onClick={() => unsubscribeFromArtist(artist.userId)}
+                              style={styles.unsubscribeButton}
+                            >
+                              <span>❌</span>
+                              <span>Se désabonner</span>
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Tous les artistes */}
+              <div style={styles.allArtistsSection}>
+                <h3 style={styles.subsectionTitle}>
+                  <span style={styles.subsectionIcon}>👥</span>
+                  Tous les Artistes de la Communauté
+                </h3>
+                
+                {artists.length === 0 ? (
+                  <div style={styles.emptyState}>
+                    <div style={styles.emptyIcon}>👥</div>
+                    <h3 style={styles.emptyTitle}>
+                      {searchArtistQuery ? "Aucun artiste trouvé" : "Aucun artiste disponible"}
+                    </h3>
+                    <p style={styles.emptySubtitle}>
+                      {searchArtistQuery 
+                        ? "Essayez de modifier votre recherche" 
+                        : "Les artistes apparaîtront ici une fois qu'ils auront publié de la musique"
+                      }
+                    </p>
+                  </div>
+                ) : (
+                  <div style={styles.artistsGrid}>
+                    {artists.map((artist) => (
+                      <div key={artist.$id} style={styles.artistCard} className="artist-card">
+                        <div style={styles.artistHeader}>
+                          <div style={styles.artistAvatar}>
+                            <img src={artist.avatar} alt={artist.name} style={styles.artistAvatarImage} />
+                          </div>
+                          {artist.userId === user.$id ? (
+                            <div style={styles.myProfileBadge}>
+                              <span>🎤</span>
+                              <span>Vous</span>
+                            </div>
+                          ) : isSubscribedToArtist(artist.userId) ? (
+                            <div style={styles.subscribedBadge}>
+                              <span>⭐</span>
+                              <span>Abonné</span>
+                            </div>
+                          ) : null}
+                        </div>
+                        
+                        <div style={styles.artistInfo}>
+                          <h4 style={styles.artistName}>{artist.artistName || artist.name}</h4>
+                          <p style={styles.artistGenre}>{artist.genre || "Artiste"}</p>
+                          {artist.bio && (
+                            <p style={styles.artistBio}>{artist.bio}</p>
+                          )}
+                          {artist.location && (
+                            <p style={styles.artistLocation}>
+                              <span>📍</span>
+                              <span>{artist.location}</span>
+                            </p>
+                          )}
+                        </div>
+
+                        <div style={styles.artistStats}>
+                          <div style={styles.artistStat}>
+                            <span style={styles.artistStatValue}>{artist.tracksCount}</span>
+                            <span style={styles.artistStatLabel}>Titres</span>
+                          </div>
+                          <div style={styles.artistStat}>
+                            <span style={styles.artistStatValue}>{artist.followersCount}</span>
+                            <span style={styles.artistStatLabel}>Abonnés</span>
+                          </div>
+                          <div style={styles.artistStat}>
+                            <span style={styles.artistStatValue}>{artist.totalPlays}</span>
+                            <span style={styles.artistStatLabel}>Lectures</span>
+                          </div>
+                        </div>
+
+                        {/* Liens sociaux */}
+                        {artist.socialLinks && Object.values(artist.socialLinks).some(link => link) && (
+                          <div style={styles.artistSocial}>
+                            {artist.socialLinks.spotify && (
+                              <a href={artist.socialLinks.spotify} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                                🎵
+                              </a>
+                            )}
+                            {artist.socialLinks.instagram && (
+                              <a href={artist.socialLinks.instagram} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                                📷
+                              </a>
+                            )}
+                            {artist.socialLinks.twitter && (
+                              <a href={artist.socialLinks.twitter} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                                🐦
+                              </a>
+                            )}
+                            {artist.socialLinks.youtube && (
+                              <a href={artist.socialLinks.youtube} target="_blank" rel="noopener noreferrer" style={styles.socialLink}>
+                                📺
+                              </a>
+                            )}
+                          </div>
+                        )}
+
+                        <div style={styles.artistActions}>
+                          {artist.userId === user.$id ? (
+                            <button
+                              onClick={() => setShowProfileModal(true)}
+                              style={styles.editProfileButton}
+                            >
+                              <span>✏️</span>
+                              <span>Modifier mon profil</span>
+                            </button>
+                          ) : isSubscribedToArtist(artist.userId) ? (
+                            <button
+                              onClick={() => unsubscribeFromArtist(artist.userId)}
+                              style={styles.unsubscribeButton}
+                            >
+                              <span>❌</span>
+                              <span>Se désabonner</span>
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => subscribeToArtist(artist.userId)}
+                              style={styles.subscribeButton}
+                            >
+                              <span>⭐</span>
+                              <span>Suivre</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Section Stats */}
           {activeTab === "stats" && (
             <div style={styles.section}>
@@ -1316,44 +2032,49 @@ const SpotifyApp = () => {
                   <div style={styles.statsGrid}>
                     <div style={styles.statCard}>
                       <div style={styles.statIcon}>🎵</div>
-                      <div style={styles.statValue}>{tracks.length}</div>
-                      <div style={styles.statLabel}>Musiques</div>
+                      <div style={styles.statValue}>{tracks.filter(track => track.uploadedBy === user.$id).length}</div>
+                      <div style={styles.statLabel}>Mes Musiques</div>
                     </div>
                     
                     <div style={styles.statCard}>
                       <div style={styles.statIcon}>▶️</div>
                       <div style={styles.statValue}>
-                        {tracks.reduce((sum, track) => sum + (track.playsCount || 0), 0)}
+                        {tracks
+                          .filter(track => track.uploadedBy === user.$id)
+                          .reduce((sum, track) => sum + (track.playsCount || 0), 0)
+                        }
                       </div>
-                      <div style={styles.statLabel}>Lectures totales</div>
+                      <div style={styles.statLabel}>Mes Lectures</div>
                     </div>
                     
                     <div style={styles.statCard}>
                       <div style={styles.statIcon}>❤️</div>
                       <div style={styles.statValue}>
-                        {tracks.reduce((sum, track) => sum + (track.likesCount || 0), 0)}
+                        {tracks
+                          .filter(track => track.uploadedBy === user.$id)
+                          .reduce((sum, track) => sum + (track.likesCount || 0), 0)
+                        }
                       </div>
-                      <div style={styles.statLabel}>Likes totaux</div>
+                      <div style={styles.statLabel}>Mes Likes</div>
                     </div>
                     
                     <div style={styles.statCard}>
-                      <div style={styles.statIcon}>🎼</div>
-                      <div style={styles.statValue}>
-                        {new Set(tracks.map(track => track.genre).filter(Boolean)).size}
-                      </div>
-                      <div style={styles.statLabel}>Genres</div>
+                      <div style={styles.statIcon}>⭐</div>
+                      <div style={styles.statValue}>{subscriptions.length}</div>
+                      <div style={styles.statLabel}>Abonnements</div>
                     </div>
                   </div>
 
-                  {/* Top tracks */}
-                  {tracks.length > 0 && (
+                  {/* Top tracks personnelles */}
+                  {tracks.filter(track => track.uploadedBy === user.$id).length > 0 && (
                     <div style={styles.topTracksSection}>
                       <h3 style={styles.topTracksTitle}>
                         <span style={styles.topTracksIcon}>🏆</span>
-                        Top Musiques
+                        Mes Top Musiques
                       </h3>
                       <div style={styles.topTracksList}>
                         {tracks
+                          .filter(track => track.uploadedBy === user.$id)
                           .sort((a, b) => (b.playsCount || 0) - (a.playsCount || 0))
                           .slice(0, 5)
                           .map((track, index) => (
@@ -1420,12 +2141,327 @@ const SpotifyApp = () => {
         </div>
       </main>
 
-      {/* Lecteur audio fixe en bas */}
+      {/* Modal de profil - AMÉLIORÉ */}
+      {showProfileModal && (
+        <div style={styles.modalOverlay} onClick={() => setShowProfileModal(false)}>
+          <div style={styles.modalContent} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <h2 style={styles.modalTitle}>
+                <span style={styles.modalIcon}>👤</span>
+                Modifier mon profil d'artiste
+              </h2>
+              <button
+                onClick={() => setShowProfileModal(false)}
+                style={styles.modalCloseButton}
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={updateProfile} style={styles.profileForm}>
+              {/* Photo de profil */}
+              <div style={styles.profileImageSection}>
+                <div style={styles.currentProfileImage}>
+                  <img 
+                    src={user.prefs?.avatar || `https://ui-avatars.com/api/?name=${user.name}&background=10b981&color=fff`}
+                    alt="Avatar actuel"
+                    style={styles.currentAvatar}
+                  />
+                </div>
+                <div style={styles.profileImageUpload}>
+                  <label style={styles.profileImageLabel}>
+                    📷 Changer la photo de profil
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => setProfileImage(e.target.files[0])}
+                      style={styles.hiddenFileInput}
+                      disabled={profileLoading}
+                    />
+                  </label>
+                  {profileImage && (
+                    <div style={styles.newImagePreview}>
+                      <span style={styles.fileIcon}>✅</span>
+                      <span style={styles.fileName}>{profileImage.name}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Informations d'artiste - NOUVEAU */}
+              <div style={styles.profileSection}>
+                <h3 style={styles.profileSectionTitle}>
+                  <span style={styles.profileSectionIcon}>🎤</span>
+                  Informations d'artiste
+                </h3>
+                <div style={styles.checkboxContainer}>
+                  <input
+                    type="checkbox"
+                    name="isArtist"
+                    checked={profileData.isArtist}
+                    onChange={handleProfileInputChange}
+                    style={styles.checkbox}
+                    disabled={profileLoading}
+                  />
+                  <label style={styles.checkboxLabel}>
+                    🎵 Je suis un artiste/musicien
+                  </label>
+                </div>
+                
+                {profileData.isArtist && (
+                  <div style={styles.profileGrid}>
+                    <div style={styles.formField}>
+                      <label style={styles.label}>Nom d'artiste</label>
+                      <input
+                        type="text"
+                        name="artistName"
+                        value={profileData.artistName}
+                        onChange={handleProfileInputChange}
+                        placeholder="Votre nom d'artiste"
+                        style={styles.input}
+                        disabled={profileLoading}
+                      />
+                    </div>
+                    <div style={styles.formField}>
+                      <label style={styles.label}>Genre musical principal</label>
+                      <select
+                        name="genre"
+                        value={profileData.genre}
+                        onChange={handleProfileInputChange}
+                        style={styles.select}
+                        disabled={profileLoading}
+                      >
+                        <option value="">Sélectionner un genre</option>
+                        {genres.map(genre => (
+                          <option key={genre} value={genre}>{genre}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Informations de base */}
+              <div style={styles.profileSection}>
+                <h3 style={styles.profileSectionTitle}>
+                  <span style={styles.profileSectionIcon}>📝</span>
+                  Informations de base
+                </h3>
+                <div style={styles.profileGrid}>
+                  <div style={styles.formField}>
+                    <label style={styles.label}>Nom complet</label>
+                    <input
+                      type="text"
+                      name="name"
+                      value={profileData.name}
+                      onChange={handleProfileInputChange}
+                      placeholder="Votre nom complet"
+                      style={styles.input}
+                      disabled={profileLoading}
+                    />
+                  </div>
+                  <div style={styles.formField}>
+                    <label style={styles.label}>Localisation</label>
+                    <input
+                      type="text"
+                      name="location"
+                      value={profileData.location}
+                      onChange={handleProfileInputChange}
+                      placeholder="Ville, Pays"
+                      style={styles.input}
+                      disabled={profileLoading}
+                    />
+                  </div>
+                </div>
+                
+                <div style={styles.formField}>
+                  <label style={styles.label}>Biographie</label>
+                  <textarea
+                    name="bio"
+                    value={profileData.bio}
+                    onChange={handleProfileInputChange}
+                    placeholder="Parlez-nous de vous, votre musique, votre parcours..."
+                    rows="4"
+                    style={styles.textarea}
+                    disabled={profileLoading}
+                  />
+                </div>
+                
+                <div style={styles.formField}>
+                  <label style={styles.label}>Site web</label>
+                  <input
+                    type="url"
+                    name="website"
+                    value={profileData.website}
+                    onChange={handleProfileInputChange}
+                    placeholder="https://votre-site.com"
+                    style={styles.input}
+                    disabled={profileLoading}
+                  />
+                </div>
+              </div>
+
+              {/* Réseaux sociaux */}
+              <div style={styles.profileSection}>
+                <h3 style={styles.profileSectionTitle}>
+                  <span style={styles.profileSectionIcon}>🌐</span>
+                  Réseaux sociaux
+                </h3>
+                <div style={styles.socialGrid}>
+                  <div style={styles.formField}>
+                    <label style={styles.label}>🎵 Spotify</label>
+                    <input
+                      type="url"
+                      name="social.spotify"
+                      value={profileData.socialLinks.spotify}
+                      onChange={handleProfileInputChange}
+                      placeholder="https://open.spotify.com/artist/..."
+                      style={styles.input}
+                      disabled={profileLoading}
+                    />
+                  </div>
+                  <div style={styles.formField}>
+                    <label style={styles.label}>📷 Instagram</label>
+                    <input
+                      type="url"
+                      name="social.instagram"
+                      value={profileData.socialLinks.instagram}
+                      onChange={handleProfileInputChange}
+                      placeholder="https://instagram.com/..."
+                      style={styles.input}
+                      disabled={profileLoading}
+                    />
+                  </div>
+                  <div style={styles.formField}>
+                    <label style={styles.label}>🐦 Twitter</label>
+                    <input
+                      type="url"
+                      name="social.twitter"
+                      value={profileData.socialLinks.twitter}
+                      onChange={handleProfileInputChange}
+                      placeholder="https://twitter.com/..."
+                      style={styles.input}
+                      disabled={profileLoading}
+                    />
+                  </div>
+                  <div style={styles.formField}>
+                    <label style={styles.label}>📺 YouTube</label>
+                    <input
+                      type="url"
+                      name="social.youtube"
+                      value={profileData.socialLinks.youtube}
+                      onChange={handleProfileInputChange}
+                      placeholder="https://youtube.com/..."
+                      style={styles.input}
+                      disabled={profileLoading}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Boutons d'action */}
+              <div style={styles.profileActions}>
+                <button
+                  type="button"
+                  onClick={() => setShowProfileModal(false)}
+                  style={styles.cancelButton}
+                  disabled={profileLoading}
+                >
+                  Annuler
+                </button>
+                <button
+                  type="submit"
+                  style={{
+                    ...styles.saveButton,
+                    ...(profileLoading ? styles.saveButtonDisabled : {})
+                  }}
+                  disabled={profileLoading}
+                >
+                  {profileLoading ? (
+                    <span style={styles.loadingContent}>
+                      <div style={styles.loadingSpinner}></div>
+                      Sauvegarde...
+                    </span>
+                  ) : (
+                    "💾 Sauvegarder"
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Lecteur audio fixe moderne */}
       {currentTrack && (
-        <div style={styles.player}>
+        <div style={styles.audioPlayer}>
           <div style={styles.playerContent}>
-            {/* Barre de progression */}
-            <div style={styles.progressSection}>
+            {/* Informations de la piste */}
+            <div style={styles.playerTrackInfo}>
+              <div style={styles.playerCover}>
+                {currentTrack.coverImage ? (
+                  <img 
+                    src={currentTrack.coverImage} 
+                    alt="Cover" 
+                    style={styles.playerCoverImage}
+                  />
+                ) : (
+                  <div style={styles.playerCoverPlaceholder}>🎵</div>
+                )}
+              </div>
+              <div style={styles.playerInfo}>
+                <div style={styles.playerTitle}>{currentTrack.title}</div>
+                <div style={styles.playerArtist}>{currentTrack.artist}</div>
+              </div>
+            </div>
+
+            {/* Contrôles principaux */}
+            <div style={styles.playerControls}>
+              <div style={styles.playerButtons}>
+                <button
+                  onClick={() => setIsShuffled(!isShuffled)}
+                  style={{
+                    ...styles.playerButton,
+                    ...(isShuffled ? styles.playerButtonActive : {})
+                  }}
+                >
+                  🔀
+                </button>
+                <button
+                  onClick={previousTrack}
+                  style={styles.playerButton}
+                >
+                  ⏮️
+                </button>
+                <button
+                  onClick={() => isPlaying ? pauseTrack() : playTrack(currentTrack)}
+                  style={styles.playerPlayButton}
+                >
+                  {isPlaying ? "⏸️" : "▶️"}
+                </button>
+                <button
+                  onClick={nextTrack}
+                  style={styles.playerButton}
+                >
+                  ⏭️
+                </button>
+                <button
+                  onClick={() => {
+                    const modes = ["none", "one", "all"];
+                    const currentIndex = modes.indexOf(repeatMode);
+                    const nextMode = modes[(currentIndex + 1) % modes.length];
+                    setRepeatMode(nextMode);
+                  }}
+                  style={{
+                    ...styles.playerButton,
+                    ...(repeatMode !== "none" ? styles.playerButtonActive : {})
+                  }}
+                >
+                  {repeatMode === "one" ? "🔂" : "🔁"}
+                </button>
+              </div>
+
+              {/* Barre de progression */}
               <div style={styles.progressContainer}>
                 <span style={styles.timeLabel}>{formatTime(currentTime)}</span>
                 <div 
@@ -1434,141 +2470,58 @@ const SpotifyApp = () => {
                     const rect = e.currentTarget.getBoundingClientRect();
                     const percent = (e.clientX - rect.left) / rect.width;
                     const newTime = percent * duration;
-                    seekToTime(newTime); // Utilisation de la fonction sécurisée
+                    seekToTime(newTime);
                   }}
                 >
                   <div 
                     style={{
                       ...styles.progressFill,
-                      width: `${duration && isFinite(duration) ? (currentTime / duration) * 100 : 0}%`
+                      width: duration ? `${(currentTime / duration) * 100}%` : '0%'
                     }}
-                  ></div>
+                  />
+                  <div 
+                    style={{
+                      ...styles.progressHandle,
+                      left: duration ? `${(currentTime / duration) * 100}%` : '0%'
+                    }}
+                  />
                 </div>
                 <span style={styles.timeLabel}>{formatTime(duration)}</span>
               </div>
             </div>
 
-            <div style={{
-              ...styles.playerMain,
-              flexDirection: isMobile ? 'column' : 'row',
-              gap: isMobile ? '1rem' : '2rem'
-            }}>
-              {/* Infos de la piste actuelle */}
-              <div style={{
-                ...styles.playerTrackInfo,
-                justifyContent: isMobile ? 'center' : 'flex-start'
-              }}>
-                <div style={styles.playerTrackCover}>
-                  {currentTrack.coverImage ? (
-                    <img src={currentTrack.coverImage} alt="Cover" style={styles.playerCoverImage} />
-                  ) : (
-                    <div style={styles.playerCoverPlaceholder}>🎵</div>
-                  )}
-                </div>
-                <div style={styles.playerTrackDetails}>
-                  <h4 style={styles.playerTrackTitle}>{currentTrack.title}</h4>
-                  <p style={styles.playerTrackArtist}>{currentTrack.artist}</p>
-                  {currentTrack.album && (
-                    <p style={styles.playerTrackAlbum}>📀 {currentTrack.album}</p>
-                  )}
-                </div>
-              </div>
-
-              {/* Contrôles centraux */}
-              <div style={{
-                ...styles.playerControls,
-                justifyContent: 'center'
-              }}>
+            {/* Contrôles secondaires */}
+            <div style={styles.playerSecondary}>
+              <button
+                onClick={() => toggleLike(currentTrack)}
+                style={styles.playerButton}
+              >
+                ❤️
+              </button>
+              
+              {/* Contrôle du volume */}
+              <div style={styles.volumeContainer}>
                 <button
-                  onClick={() => setIsShuffled(!isShuffled)}
-                  style={{
-                    ...styles.controlButton,
-                    ...(isShuffled ? styles.controlButtonActive : {})
+                  onClick={() => setVolume(volume === 0 ? 1 : 0)}
+                  style={styles.playerButton}
+                >
+                  {volume === 0 ? "🔇" : volume < 0.5 ? "🔉" : "🔊"}
+                </button>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.1"
+                  value={volume}
+                  onChange={(e) => {
+                    const newVolume = parseFloat(e.target.value);
+                    setVolume(newVolume);
+                    if (audioRef.current) {
+                      audioRef.current.volume = newVolume;
+                    }
                   }}
-                  className="control-button"
-                  title="Lecture aléatoire"
-                >
-                  🔀
-                </button>
-                
-                <button
-                  onClick={previousTrack}
-                  style={styles.controlButton}
-                  className="control-button"
-                  title="Précédent"
-                >
-                  ⏮️
-                </button>
-                
-                <button
-                  onClick={() => isPlaying ? pauseTrack() : playTrack(currentTrack)}
-                  style={styles.playControlButton}
-                  className="play-control-button"
-                  title={isPlaying ? "Pause" : "Jouer"}
-                >
-                  {isPlaying ? "⏸️" : "▶️"}
-                </button>
-                
-                <button
-                  onClick={nextTrack}
-                  style={styles.controlButton}
-                  className="control-button"
-                  title="Suivant"
-                >
-                  ⏭️
-                </button>
-                
-                <button
-                  onClick={() => {
-                    const modes = ["none", "one", "all"];
-                    const currentIndex = modes.indexOf(repeatMode);
-                    setRepeatMode(modes[(currentIndex + 1) % modes.length]);
-                  }}
-                  style={{
-                    ...styles.controlButton,
-                    ...(repeatMode !== "none" ? styles.controlButtonActive : {})
-                  }}
-                  className="control-button"
-                  title={`Répétition: ${repeatMode === "none" ? "Désactivée" : repeatMode === "one" ? "Une seule" : "Toutes"}`}
-                >
-                  {repeatMode === "one" ? "🔂" : "🔁"}
-                </button>
-              </div>
-
-              {/* Contrôles de volume et actions */}
-              <div style={{
-                ...styles.playerActions,
-                justifyContent: isMobile ? 'center' : 'flex-end'
-              }}>
-                <button
-                  onClick={() => toggleLike(currentTrack)}
-                  style={styles.likeButton}
-                  title="J'aime"
-                >
-                  ❤️
-                </button>
-                
-                {!isMobile && (
-                  <div style={styles.volumeControl}>
-                    <span style={styles.volumeIcon}>🔊</span>
-                    <input
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.1"
-                      value={volume}
-                      onChange={(e) => {
-                        const newVolume = parseFloat(e.target.value);
-                        setVolume(newVolume);
-                        if (audioRef.current) {
-                          audioRef.current.volume = newVolume;
-                        }
-                      }}
-                      style={styles.volumeSlider}
-                    />
-                    <span style={styles.volumeLabel}>{Math.round(volume * 100)}%</span>
-                  </div>
-                )}
+                  style={styles.volumeSlider}
+                />
               </div>
             </div>
           </div>
@@ -1578,482 +2531,542 @@ const SpotifyApp = () => {
   );
 };
 
-// Styles CSS-in-JS améliorés
+// Styles CSS-in-JS complets et modernes
 const styles = {
-  // Page de connexion
-  loginContainer: {
+  // Container principal
+  appContainer: {
     minHeight: '100vh',
-    background: 'linear-gradient(135deg, #0f172a 0%, #1e3a8a 50%, #059669 100%)',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: '1rem',
+    background: 'linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #334155 100%)',
+    color: 'white',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     position: 'relative',
     overflow: 'hidden'
   },
-  particles: {
-    position: 'absolute',
-    inset: 0,
+
+  // Page de connexion
+  loginContainer: {
+    minHeight: '100vh',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #334155 100%)',
+    position: 'relative',
     overflow: 'hidden'
   },
+
+  particles: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: '100%',
+    pointerEvents: 'none',
+    zIndex: 1
+  },
+
   particle: {
     position: 'absolute',
     width: '4px',
     height: '4px',
-    backgroundColor: '#10b981',
+    background: 'rgba(16, 185, 129, 0.6)',
     borderRadius: '50%',
-    opacity: 0.3,
     animation: 'float 6s ease-in-out infinite'
   },
+
   loginContent: {
     textAlign: 'center',
-    maxWidth: '28rem',
-    width: '100%',
+    zIndex: 2,
     position: 'relative',
-    zIndex: 10
+    maxWidth: '400px',
+    padding: '2rem'
   },
+
   loginHeader: {
     position: 'relative',
     marginBottom: '2rem'
   },
+
   loginIcon: {
-    fontSize: '5rem',
+    fontSize: '4rem',
     marginBottom: '1rem',
-    animation: 'bounce 2s infinite'
-  },
-  loginGlow: {
-    position: 'absolute',
-    inset: 0,
-    background: 'linear-gradient(to right, #10b981, #fbbf24, #3b82f6)',
-    opacity: 0.2,
-    filter: 'blur(3rem)',
-    borderRadius: '50%',
-    animation: 'pulse 3s infinite'
-  },
-  loginTitle: {
-    fontSize: '3.75rem',
-    fontWeight: 900,
-    marginBottom: '1rem',
-    background: 'linear-gradient(to right, #10b981, #fbbf24, #3b82f6)',
-    WebkitBackgroundClip: 'text',
-    WebkitTextFillColor: 'transparent',
-    backgroundClip: 'text'
-  },
-  loginSubtitle: {
-    fontSize: '1.25rem',
-    color: '#cbd5e1',
-    marginBottom: '2rem',
-    lineHeight: 1.6
-  },
-  loginButton: {
     position: 'relative',
-    padding: '1rem 2rem',
-    background: 'linear-gradient(to right, #10b981, #fbbf24, #3b82f6)',
-    color: 'white',
-    fontWeight: 'bold',
-    fontSize: '1.125rem',
-    borderRadius: '1rem',
-    border: 'none',
-    cursor: 'pointer',
-    overflow: 'hidden',
-    transition: 'all 0.3s ease',
-    boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)'
-  },
-  loginButtonContent: {
-    position: 'relative',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: '0.75rem'
-  },
-  googleIcon: {
-    width: '1.5rem',
-    height: '1.5rem'
+    zIndex: 2
   },
 
-  // Container principal
-  appContainer: {
-    height: '100vh',
-    background: 'linear-gradient(135deg, #0f172a 0%, #1e3a8a 50%, #059669 100%)',
-    display: 'flex',
-    flexDirection: 'column',
+  loginGlow: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    transform: 'translate(-50%, -50%)',
+    width: '120px',
+    height: '120px',
+    background: 'radial-gradient(circle, rgba(16, 185, 129, 0.3) 0%, transparent 70%)',
+    borderRadius: '50%',
+    filter: 'blur(20px)',
+    zIndex: 1
+  },
+
+  loginTitle: {
+    fontSize: '3rem',
+    fontWeight: 'bold',
+    background: 'linear-gradient(135deg, #10b981, #34d399)',
+    WebkitBackgroundClip: 'text',
+    WebkitTextFillColor: 'transparent',
+    marginBottom: '1rem'
+  },
+
+  loginSubtitle: {
+    fontSize: '1.1rem',
+    color: 'rgba(255, 255, 255, 0.7)',
+    marginBottom: '3rem',
+    lineHeight: '1.6'
+  },
+
+  loginButton: {
+    background: 'linear-gradient(135deg, #10b981, #059669)',
+    border: 'none',
+    borderRadius: '12px',
+    padding: '1rem 2rem',
+    fontSize: '1.1rem',
+    fontWeight: '600',
+    color: 'white',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)',
+    position: 'relative',
     overflow: 'hidden'
   },
 
-  // Header amélioré
+  loginButtonContent: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.75rem',
+    position: 'relative',
+    zIndex: 2
+  },
+
+  googleIcon: {
+    width: '20px',
+    height: '20px'
+  },
+
+  // Header
   header: {
     position: 'fixed',
     top: 0,
     left: 0,
     right: 0,
-    zIndex: 50,
-    transition: 'all 0.3s ease',
-    background: 'rgba(15, 23, 42, 0.95)',
-    backdropFilter: 'blur(12px)',
-    borderBottom: '1px solid rgba(71, 85, 105, 0.3)'
+    background: 'rgba(15, 23, 42, 0.8)',
+    backdropFilter: 'blur(20px)',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+    zIndex: 1000,
+    transition: 'all 0.3s ease'
   },
+
   headerScrolled: {
-    background: 'rgba(15, 23, 42, 0.98)',
-    borderBottomColor: 'rgba(71, 85, 105, 0.5)',
-    boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)'
+    background: 'rgba(15, 23, 42, 0.95)',
+    boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.1)'
   },
+
   headerContent: {
-    maxWidth: '80rem',
-    margin: '0 auto',
-    padding: '0 1rem',
     display: 'flex',
-    justifyContent: 'space-between',
     alignItems: 'center',
-    height: '4rem'
+    justifyContent: 'space-between',
+    padding: '1rem 2rem',
+    maxWidth: '1400px',
+    margin: '0 auto'
   },
+
   headerLeft: {
     display: 'flex',
     alignItems: 'center',
     gap: '1rem'
   },
+
   headerIcon: {
-    fontSize: '1.875rem',
-    animation: 'float 3s ease-in-out infinite'
+    fontSize: '2rem',
+    background: 'linear-gradient(135deg, #10b981, #34d399)',
+    WebkitBackgroundClip: 'text',
+    WebkitTextFillColor: 'transparent'
   },
+
   headerTitle: {
     fontSize: '1.5rem',
-    fontWeight: 900,
-    background: 'linear-gradient(to right, #10b981, #fbbf24, #3b82f6)',
+    fontWeight: 'bold',
+    background: 'linear-gradient(135deg, #10b981, #34d399)',
     WebkitBackgroundClip: 'text',
     WebkitTextFillColor: 'transparent',
-    backgroundClip: 'text'
+    margin: 0
   },
+
+  // Navigation
   navigation: {
     display: 'flex',
-    alignItems: 'center',
-    gap: '0.5rem',
-    background: 'rgba(30, 41, 59, 0.5)',
-    backdropFilter: 'blur(4px)',
-    borderRadius: '1rem',
-    padding: '0.5rem',
-    border: '1px solid rgba(71, 85, 105, 0.5)'
+    gap: '0.5rem'
   },
+
   navButton: {
-    position: 'relative',
-    padding: '0.5rem 1rem',
-    borderRadius: '0.75rem',
-    fontWeight: 600,
-    transition: 'all 0.3s ease',
     display: 'flex',
     alignItems: 'center',
     gap: '0.5rem',
-    border: 'none',
+    padding: '0.75rem 1rem',
     background: 'transparent',
-    color: '#94a3b8',
-    cursor: 'pointer'
+    border: 'none',
+    borderRadius: '8px',
+    color: 'rgb(148, 163, 184)',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.9rem',
+    fontWeight: '500',
+    position: 'relative'
   },
+
   navButtonActive: {
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
+    background: 'linear-gradient(135deg, #10b981, #059669)',
     color: 'white',
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)',
-    transform: 'scale(1.05)'
+    boxShadow: '0 4px 12px rgba(16, 185, 129, 0.3)'
   },
+
   navButtonLabel: {
-    display: 'none',
-    '@media (min-width: 1024px)': {
-      display: 'inline'
-    }
+    fontSize: '0.9rem'
   },
+
   navButtonBadge: {
-    background: '#059669',
-    color: 'white',
+    background: 'rgba(255, 255, 255, 0.2)',
+    borderRadius: '10px',
+    padding: '0.2rem 0.5rem',
     fontSize: '0.75rem',
-    padding: '0.125rem 0.5rem',
-    borderRadius: '9999px'
+    fontWeight: 'bold',
+    minWidth: '20px',
+    textAlign: 'center'
   },
+
+  // Header right
   headerRight: {
     display: 'flex',
     alignItems: 'center',
     gap: '1rem'
   },
+
   userInfo: {
     textAlign: 'right'
   },
+
   userWelcome: {
-    color: '#cbd5e1',
-    fontSize: '0.875rem',
+    fontSize: '0.8rem',
+    color: 'rgba(255, 255, 255, 0.6)',
     margin: 0
   },
+
   userName: {
-    fontWeight: 600,
-    color: '#10b981',
+    fontSize: '0.9rem',
+    fontWeight: '600',
     margin: 0
   },
+
   avatarContainer: {
     position: 'relative'
   },
+
   avatar: {
-    width: '2.5rem',
-    height: '2.5rem',
+    width: '40px',
+    height: '40px',
     borderRadius: '50%',
-    border: '2px solid #10b981',
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)',
+    border: '2px solid rgba(16, 185, 129, 0.5)',
     cursor: 'pointer',
-    transition: 'transform 0.3s ease'
+    transition: 'all 0.3s ease'
   },
+
   avatarStatus: {
     position: 'absolute',
-    bottom: '-0.25rem',
-    right: '-0.25rem',
-    width: '1rem',
-    height: '1rem',
+    bottom: '2px',
+    right: '2px',
+    width: '12px',
+    height: '12px',
     background: '#10b981',
     borderRadius: '50%',
-    border: '2px solid #0f172a',
-    animation: 'pulse 2s infinite'
-  },
-  logoutButton: {
-    color: '#f87171',
-    fontWeight: 600,
-    padding: '0.5rem 0.75rem',
-    borderRadius: '0.5rem',
-    transition: 'all 0.3s ease',
-    fontSize: '0.875rem',
-    border: 'none',
-    background: 'transparent',
-    cursor: 'pointer'
+    border: '2px solid #0f172a'
   },
 
-  // Navigation mobile améliorée
+  logoutButton: {
+    background: 'transparent',
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+    borderRadius: '8px',
+    padding: '0.5rem 1rem',
+    color: 'rgb(239, 68, 68)',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.9rem',
+    fontWeight: '500'
+  },
+
+  // Navigation mobile
   mobileNav: {
     position: 'fixed',
-    top: '4rem',
+    top: '80px',
     left: 0,
     right: 0,
-    zIndex: 40,
     background: 'rgba(15, 23, 42, 0.95)',
-    backdropFilter: 'blur(12px)',
-    borderBottom: '1px solid rgba(71, 85, 105, 0.5)',
-    padding: '0.75rem 1rem'
-  },
-  mobileNavContent: {
-    display: 'flex',
-    gap: '0.5rem',
-    overflowX: 'auto'
-  },
-  mobileNavButton: {
-    flexShrink: 0,
-    padding: '0.5rem 1rem',
-    borderRadius: '0.75rem',
-    fontWeight: 600,
-    transition: 'all 0.3s ease',
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.5rem',
-    border: 'none',
-    background: 'rgba(30, 41, 59, 0.5)',
-    color: '#cbd5e1',
-    cursor: 'pointer'
-  },
-  mobileNavButtonActive: {
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
-    color: 'white',
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)'
-  },
-  mobileNavBadge: {
-    background: '#059669',
-    color: 'white',
-    fontSize: '0.75rem',
-    padding: '0.125rem 0.5rem',
-    borderRadius: '9999px'
+    backdropFilter: 'blur(20px)',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+    zIndex: 999,
+    padding: '1rem'
   },
 
-  // Contenu principal avec padding adaptatif
+  mobileNavContent: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(4, 1fr)',
+    gap: '0.5rem',
+    maxWidth: '400px',
+    margin: '0 auto'
+  },
+
+  mobileNavButton: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: '0.25rem',
+    padding: '0.75rem 0.5rem',
+    background: 'transparent',
+    border: 'none',
+    borderRadius: '8px',
+    color: 'rgb(148, 163, 184)',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.75rem',
+    fontWeight: '500',
+    position: 'relative'
+  },
+
+  mobileNavButtonActive: {
+    background: 'linear-gradient(135deg, #10b981, #059669)',
+    color: 'white',
+    boxShadow: '0 4px 12px rgba(16, 185, 129, 0.3)'
+  },
+
+  mobileNavBadge: {
+    position: 'absolute',
+    top: '0.25rem',
+    right: '0.25rem',
+    background: '#ef4444',
+    borderRadius: '10px',
+    padding: '0.1rem 0.3rem',
+    fontSize: '0.6rem',
+    fontWeight: 'bold',
+    minWidth: '16px',
+    textAlign: 'center'
+  },
+
+  // Contenu principal
   mainContent: {
-    flex: 1,
+    paddingTop: '6rem',
+    paddingBottom: '3rem',
+    minHeight: '100vh',
     overflowY: 'auto',
     scrollBehavior: 'smooth'
   },
+
   contentContainer: {
-    maxWidth: '80rem',
+    maxWidth: '1400px',
     margin: '0 auto',
-    padding: '2rem 1rem'
+    padding: '0 2rem'
   },
 
   // Sections
   section: {
-    animation: 'fadeIn 0.6s ease-out'
+    marginBottom: '3rem'
   },
+
   sectionHeader: {
     textAlign: 'center',
     marginBottom: '3rem'
   },
+
   sectionTitle: {
-    fontSize: '2.25rem',
-    '@media (min-width: 768px)': {
-      fontSize: '3.75rem'
-    },
-    fontWeight: 900,
-    marginBottom: '1rem',
-    background: 'linear-gradient(to right, #10b981, #fbbf24, #3b82f6)',
+    fontSize: '2.5rem',
+    fontWeight: 'bold',
+    background: 'linear-gradient(135deg, #10b981, #34d399)',
     WebkitBackgroundClip: 'text',
     WebkitTextFillColor: 'transparent',
-    backgroundClip: 'text'
+    marginBottom: '0.5rem'
   },
+
   sectionSubtitle: {
-    fontSize: '1.25rem',
-    color: '#cbd5e1'
+    fontSize: '1.1rem',
+    color: 'rgba(255, 255, 255, 0.7)',
+    maxWidth: '600px',
+    margin: '0 auto'
   },
 
   // Filtres
   filtersContainer: {
-    background: 'rgba(30, 41, 59, 0.5)',
-    backdropFilter: 'blur(12px)',
-    padding: '1.5rem',
-    borderRadius: '1.5rem',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
     marginBottom: '2rem'
   },
+
   filtersGrid: {
     display: 'grid',
-    gridTemplateColumns: '1fr',
-    '@media (min-width: 768px)': {
-      gridTemplateColumns: 'repeat(4, 1fr)'
-    },
-    gap: '1rem'
+    gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+    gap: '1rem',
+    alignItems: 'end'
   },
+
   searchContainer: {
     position: 'relative'
   },
+
   searchIcon: {
     position: 'absolute',
     left: '1rem',
     top: '50%',
     transform: 'translateY(-50%)',
-    color: '#94a3b8',
-    pointerEvents: 'none'
+    color: 'rgba(255, 255, 255, 0.5)',
+    zIndex: 2
   },
+
+  // Inputs et formulaires
   input: {
     width: '100%',
     padding: '0.75rem 1rem',
-    paddingLeft: '3rem',
-    background: 'rgba(30, 41, 59, 0.8)',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    borderRadius: '0.75rem',
+    paddingLeft: '2.5rem',
+    background: 'rgba(255, 255, 255, 0.05)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    borderRadius: '8px',
     color: 'white',
-    fontSize: '0.875rem',
+    fontSize: '0.9rem',
     transition: 'all 0.3s ease',
     outline: 'none'
   },
+
   select: {
     width: '100%',
     padding: '0.75rem 1rem',
-    background: 'rgba(30, 41, 59, 0.8)',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    borderRadius: '0.75rem',
+    background: 'rgba(255, 255, 255, 0.05)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    borderRadius: '8px',
     color: 'white',
-    fontSize: '0.875rem',
+    fontSize: '0.9rem',
     transition: 'all 0.3s ease',
-    outline: 'none'
-  },
-  resetButton: {
-    padding: '0.75rem 1rem',
-    background: 'rgba(71, 85, 105, 0.5)',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    borderRadius: '0.75rem',
-    color: '#cbd5e1',
-    fontSize: '0.875rem',
-    fontWeight: 600,
-    cursor: 'pointer',
-    transition: 'all 0.3s ease'
+    outline: 'none',
+    cursor: 'pointer'
   },
 
-  // État vide
-  emptyState: {
-    textAlign: 'center',
-    padding: '5rem 0'
-  },
-  emptyIcon: {
-    fontSize: '5rem',
-    marginBottom: '1.5rem',
-    animation: 'bounce 2s infinite'
-  },
-  emptyTitle: {
-    fontSize: '1.875rem',
-    fontWeight: 'bold',
-    color: '#cbd5e1',
-    marginBottom: '1rem'
-  },
-  emptySubtitle: {
-    color: '#94a3b8',
-    marginBottom: '2rem',
-    fontSize: '1.125rem'
-  },
-  primaryButton: {
-    padding: '1rem 2rem',
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
+  textarea: {
+    width: '100%',
+    padding: '0.75rem 1rem',
+    background: 'rgba(255, 255, 255, 0.05)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    borderRadius: '8px',
     color: 'white',
-    fontWeight: 'bold',
-    borderRadius: '1rem',
-    border: 'none',
+    fontSize: '0.9rem',
+    transition: 'all 0.3s ease',
+    outline: 'none',
+    resize: 'vertical',
+    fontFamily: 'inherit'
+  },
+
+  resetButton: {
+    padding: '0.75rem 1rem',
+    background: 'rgba(239, 68, 68, 0.1)',
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+    borderRadius: '8px',
+    color: '#ef4444',
     cursor: 'pointer',
     transition: 'all 0.3s ease',
-    fontSize: '1rem'
+    fontSize: '0.9rem',
+    fontWeight: '500'
+  },
+
+  // États vides
+  emptyState: {
+    textAlign: 'center',
+    padding: '4rem 2rem',
+    background: 'rgba(255, 255, 255, 0.02)',
+    borderRadius: '16px',
+    border: '1px solid rgba(255, 255, 255, 0.05)'
+  },
+
+  emptyIcon: {
+    fontSize: '4rem',
+    marginBottom: '1rem',
+    opacity: 0.5
+  },
+
+  emptyTitle: {
+    fontSize: '1.5rem',
+    fontWeight: '600',
+    marginBottom: '0.5rem',
+    color: 'rgba(255, 255, 255, 0.8)'
+  },
+
+  emptySubtitle: {
+    color: 'rgba(255, 255, 255, 0.6)',
+    marginBottom: '2rem'
+  },
+
+  primaryButton: {
+    background: 'linear-gradient(135deg, #10b981, #059669)',
+    border: 'none',
+    borderRadius: '8px',
+    padding: '0.75rem 1.5rem',
+    color: 'white',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.9rem',
+    fontWeight: '600'
   },
 
   // Grille de musiques
   tracksGrid: {
     display: 'grid',
-    gridTemplateColumns: '1fr',
-    '@media (min-width: 640px)': {
-      gridTemplateColumns: 'repeat(2, 1fr)'
-    },
-    '@media (min-width: 1024px)': {
-      gridTemplateColumns: 'repeat(3, 1fr)'
-    },
-    '@media (min-width: 1280px)': {
-      gridTemplateColumns: 'repeat(4, 1fr)'
-    },
-    '@media (min-width: 1536px)': {
-      gridTemplateColumns: 'repeat(5, 1fr)'
-    },
+    gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
     gap: '1.5rem'
   },
 
-  // Carte de musique
   trackCard: {
-    background: 'rgba(30, 41, 59, 0.8)',
-    backdropFilter: 'blur(12px)',
-    borderRadius: '1rem',
+    background: 'rgba(255, 255, 255, 0.03)',
+    borderRadius: '16px',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
     overflow: 'hidden',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
     transition: 'all 0.3s ease',
     cursor: 'pointer',
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)'
+    position: 'relative'
   },
+
   trackCardActive: {
-    border: '2px solid #10b981',
-    boxShadow: '0 20px 25px -5px rgba(16, 185, 129, 0.2)'
+    border: '1px solid rgba(16, 185, 129, 0.5)',
+    boxShadow: '0 8px 32px rgba(16, 185, 129, 0.2)'
   },
+
   trackCover: {
     position: 'relative',
     width: '100%',
-    height: '12rem',
+    height: '200px',
     overflow: 'hidden'
   },
+
   coverImage: {
     width: '100%',
     height: '100%',
     objectFit: 'cover'
   },
+
   coverPlaceholder: {
     width: '100%',
     height: '100%',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    color: '#64748b',
-    fontSize: '3.75rem'
+    background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.1), rgba(52, 211, 153, 0.1))',
+    fontSize: '3rem',
+    color: 'rgba(16, 185, 129, 0.5)'
   },
+
   coverOverlay: {
     position: 'absolute',
-    inset: 0,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     background: 'rgba(0, 0, 0, 0.7)',
     display: 'flex',
     alignItems: 'center',
@@ -2061,782 +3074,1221 @@ const styles = {
     opacity: 0,
     transition: 'opacity 0.3s ease'
   },
+
   playButton: {
-    width: '4rem',
-    height: '4rem',
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
+    background: 'linear-gradient(135deg, #10b981, #059669)',
     border: 'none',
     borderRadius: '50%',
-    color: 'white',
+    width: '60px',
+    height: '60px',
     fontSize: '1.5rem',
+    color: 'white',
     cursor: 'pointer',
     transition: 'all 0.3s ease',
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)'
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center'
   },
+
   playingBadge: {
     position: 'absolute',
     top: '0.75rem',
-    right: '0.75rem',
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
-    color: 'white',
+    left: '0.75rem',
+    background: 'rgba(16, 185, 129, 0.9)',
+    borderRadius: '20px',
     padding: '0.25rem 0.75rem',
-    borderRadius: '9999px',
     fontSize: '0.75rem',
-    fontWeight: 600,
+    fontWeight: '600',
     display: 'flex',
     alignItems: 'center',
     gap: '0.5rem'
   },
+
   playingIndicator: {
-    width: '0.5rem',
-    height: '0.5rem',
+    width: '8px',
+    height: '8px',
     background: 'white',
     borderRadius: '50%',
-    animation: 'pulse 2s infinite'
+    animation: 'pulse 1.5s ease-in-out infinite'
   },
+
   explicitBadge: {
     position: 'absolute',
     top: '0.75rem',
-    left: '0.75rem',
-    background: 'linear-gradient(to right, #dc2626, #b91c1c)',
-    color: 'white',
+    right: '0.75rem',
+    background: 'rgba(239, 68, 68, 0.9)',
+    borderRadius: '20px',
     padding: '0.25rem 0.75rem',
-    borderRadius: '9999px',
     fontSize: '0.75rem',
-    fontWeight: 600
+    fontWeight: '600'
   },
+
   trackInfo: {
-    padding: '1rem',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.75rem'
+    padding: '1.5rem'
   },
+
   trackTitle: {
-    fontWeight: 'bold',
-    color: 'white',
-    fontSize: '1.125rem',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-    transition: 'color 0.3s ease'
+    fontSize: '1.1rem',
+    fontWeight: '600',
+    marginBottom: '0.25rem',
+    color: 'white'
   },
+
   trackArtist: {
-    color: '#94a3b8',
-    fontSize: '0.875rem',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap'
+    color: 'rgba(255, 255, 255, 0.7)',
+    marginBottom: '1rem'
   },
+
   trackMeta: {
     display: 'flex',
     flexWrap: 'wrap',
     gap: '0.5rem',
-    fontSize: '0.75rem'
+    marginBottom: '1rem'
   },
+
   metaBadge: {
-    background: 'rgba(71, 85, 105, 0.5)',
-    color: '#cbd5e1',
+    background: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: '12px',
     padding: '0.25rem 0.5rem',
-    borderRadius: '0.375rem',
-    fontSize: '0.75rem'
+    fontSize: '0.75rem',
+    color: 'rgba(255, 255, 255, 0.8)'
   },
+
   trackStats: {
     display: 'flex',
-    alignItems: 'center',
     justifyContent: 'space-between',
-    fontSize: '0.75rem',
-    color: '#94a3b8'
+    alignItems: 'center',
+    marginBottom: '1rem'
   },
+
   statsLeft: {
     display: 'flex',
-    alignItems: 'center',
-    gap: '0.75rem'
+    gap: '1rem'
   },
+
   statItem: {
     display: 'flex',
     alignItems: 'center',
-    gap: '0.25rem'
+    gap: '0.25rem',
+    fontSize: '0.8rem',
+    color: 'rgba(255, 255, 255, 0.6)'
   },
+
   trackDuration: {
-    fontFamily: 'monospace'
+    fontSize: '0.8rem',
+    color: 'rgba(255, 255, 255, 0.6)',
+    fontWeight: '500'
   },
+
   trackActions: {
     display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingTop: '0.5rem',
-    borderTop: '1px solid rgba(71, 85, 105, 0.5)'
+    gap: '0.5rem'
   },
+
   actionButton: {
     display: 'flex',
     alignItems: 'center',
     gap: '0.5rem',
-    color: '#f87171',
-    background: 'transparent',
-    border: 'none',
+    padding: '0.5rem 1rem',
+    background: 'rgba(255, 255, 255, 0.05)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    borderRadius: '8px',
+    color: 'rgba(255, 255, 255, 0.8)',
     cursor: 'pointer',
-    transition: 'all 0.3s ease'
+    transition: 'all 0.3s ease',
+    fontSize: '0.8rem'
   },
+
+  actionLabel: {
+    fontSize: '0.8rem'
+  },
+
   deleteButton: {
     display: 'flex',
     alignItems: 'center',
     gap: '0.5rem',
-    color: '#f87171',
-    background: 'transparent',
-    border: 'none',
+    padding: '0.5rem 1rem',
+    background: 'rgba(239, 68, 68, 0.1)',
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+    borderRadius: '8px',
+    color: '#ef4444',
     cursor: 'pointer',
-    transition: 'all 0.3s ease'
-  },
-  actionLabel: {
-    fontSize: '0.75rem'
+    transition: 'all 0.3s ease',
+    fontSize: '0.8rem'
   },
 
   // Formulaire d'upload
   uploadContainer: {
-    maxWidth: '64rem',
+    maxWidth: '800px',
     margin: '0 auto'
   },
+
   uploadForm: {
-    background: 'rgba(30, 41, 59, 0.5)',
-    backdropFilter: 'blur(12px)',
-    padding: '2rem',
-    borderRadius: '1.5rem',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)'
+    background: 'rgba(255, 255, 255, 0.02)',
+    borderRadius: '16px',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
+    padding: '2rem'
   },
+
   form: {
     display: 'flex',
     flexDirection: 'column',
     gap: '2rem'
   },
+
   progressContainer: {
-    background: 'rgba(30, 41, 59, 0.8)',
-    padding: '1rem',
-    borderRadius: '0.75rem',
-    border: '1px solid rgba(71, 85, 105, 0.5)'
+    marginBottom: '1rem'
   },
+
   progressLabel: {
-    color: '#10b981',
-    fontWeight: 600,
+    fontSize: '0.9rem',
+    color: 'rgba(255, 255, 255, 0.8)',
     marginBottom: '0.5rem',
     textAlign: 'center'
   },
+
   progressBar: {
     width: '100%',
-    height: '0.5rem',
-    background: 'rgba(71, 85, 105, 0.5)',
-    borderRadius: '0.25rem',
-    overflow: 'hidden'
+    height: '8px',
+    background: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: '4px',
+    overflow: 'hidden',
+    cursor: 'pointer'
   },
+
   progressFill: {
     height: '100%',
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
-    borderRadius: '0.25rem',
+    background: 'linear-gradient(135deg, #10b981, #34d399)',
+    borderRadius: '4px',
     transition: 'width 0.3s ease'
   },
+
+  progressHandle: {
+    position: 'absolute',
+    top: '50%',
+    transform: 'translate(-50%, -50%)',
+    width: '16px',
+    height: '16px',
+    background: 'white',
+    borderRadius: '50%',
+    boxShadow: '0 2px 8px rgba(0, 0, 0, 0.3)',
+    cursor: 'pointer',
+    transition: 'left 0.1s ease'
+  },
+
   formSection: {
-    background: 'rgba(30, 41, 59, 0.3)',
+    background: 'rgba(255, 255, 255, 0.02)',
+    borderRadius: '12px',
     padding: '1.5rem',
-    borderRadius: '1rem',
-    border: '1px solid rgba(71, 85, 105, 0.3)'
+    border: '1px solid rgba(255, 255, 255, 0.05)'
   },
+
   formSectionTitle: {
-    fontSize: '1.25rem',
-    fontWeight: 'bold',
-    marginBottom: '1.5rem',
-    color: '#10b981',
     display: 'flex',
-    alignItems: 'center'
+    alignItems: 'center',
+    gap: '0.5rem',
+    fontSize: '1.1rem',
+    fontWeight: '600',
+    marginBottom: '1rem',
+    color: 'rgba(255, 255, 255, 0.9)'
   },
+
   formSectionIcon: {
-    marginRight: '0.75rem'
+    fontSize: '1.2rem'
   },
+
   formGrid: {
     display: 'grid',
-    gridTemplateColumns: '1fr',
-    '@media (min-width: 768px)': {
-      gridTemplateColumns: 'repeat(2, 1fr)'
-    },
-    gap: '1.5rem'
+    gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))',
+    gap: '1rem'
   },
+
   metaGrid: {
     display: 'grid',
-    gridTemplateColumns: 'repeat(2, 1fr)',
-    '@media (min-width: 768px)': {
-      gridTemplateColumns: 'repeat(4, 1fr)'
-    },
+    gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
     gap: '1rem',
     marginBottom: '1rem'
   },
-  formField: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.5rem'
-  },
-  label: {
-    fontSize: '0.875rem',
-    fontWeight: 500,
-    color: '#cbd5e1'
-  },
-  smallLabel: {
-    fontSize: '0.75rem',
-    fontWeight: 500,
-    color: '#94a3b8'
-  },
-  smallInput: {
-    width: '100%',
-    padding: '0.5rem 0.75rem',
-    background: 'rgba(30, 41, 59, 0.8)',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    borderRadius: '0.5rem',
-    color: 'white',
-    fontSize: '0.875rem',
-    transition: 'all 0.3s ease',
-    outline: 'none'
-  },
-  textarea: {
-    width: '100%',
-    padding: '0.75rem 1rem',
-    background: 'rgba(30, 41, 59, 0.8)',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    borderRadius: '0.75rem',
-    color: 'white',
-    fontSize: '0.875rem',
-    transition: 'all 0.3s ease',
-    outline: 'none',
-    resize: 'vertical',
-    minHeight: '6rem'
-  },
-  fileInput: {
-    width: '100%',
-    padding: '0.75rem 1rem',
-    background: 'rgba(30, 41, 59, 0.8)',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    borderRadius: '0.75rem',
-    color: 'white',
-    fontSize: '0.875rem',
-    transition: 'all 0.3s ease',
-    outline: 'none'
-  },
-  filePreview: {
-    display: 'flex',
-    alignItems: 'center',
-    color: '#10b981',
-    fontSize: '0.875rem',
-    background: 'rgba(16, 185, 129, 0.2)',
-    padding: '0.75rem',
-    borderRadius: '0.5rem'
-  },
-  fileIcon: {
-    marginRight: '0.5rem'
-  },
-  fileName: {
-    flex: 1,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap'
-  },
-  fileSize: {
-    marginLeft: 'auto',
-    color: '#94a3b8'
-  },
+
   contentFields: {
     display: 'flex',
     flexDirection: 'column',
     gap: '1rem'
   },
+
+  formField: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.5rem'
+  },
+
+  label: {
+    fontSize: '0.9rem',
+    fontWeight: '500',
+    color: 'rgba(255, 255, 255, 0.8)'
+  },
+
+  smallLabel: {
+    fontSize: '0.8rem',
+    fontWeight: '500',
+    color: 'rgba(255, 255, 255, 0.8)'
+  },
+
+  smallInput: {
+    width: '100%',
+    padding: '0.5rem 0.75rem',
+    background: 'rgba(255, 255, 255, 0.05)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    borderRadius: '6px',
+    color: 'white',
+    fontSize: '0.8rem',
+    transition: 'all 0.3s ease',
+    outline: 'none'
+  },
+
+  fileInput: {
+    width: '100%',
+    padding: '0.75rem',
+    background: 'rgba(255, 255, 255, 0.05)',
+    border: '2px dashed rgba(255, 255, 255, 0.2)',
+    borderRadius: '8px',
+    color: 'rgba(255, 255, 255, 0.8)',
+    fontSize: '0.9rem',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease'
+  },
+
+  filePreview: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.5rem',
+    marginTop: '0.5rem',
+    padding: '0.5rem',
+    background: 'rgba(16, 185, 129, 0.1)',
+    borderRadius: '6px',
+    border: '1px solid rgba(16, 185, 129, 0.3)'
+  },
+
+  fileIcon: {
+    fontSize: '1rem'
+  },
+
+  fileName: {
+    fontSize: '0.8rem',
+    color: 'rgba(255, 255, 255, 0.9)',
+    flex: 1
+  },
+
+  fileSize: {
+    fontSize: '0.7rem',
+    color: 'rgba(255, 255, 255, 0.6)'
+  },
+
   checkboxContainer: {
     display: 'flex',
     alignItems: 'center',
     gap: '0.75rem'
   },
+
   checkbox: {
-    width: '1.25rem',
-    height: '1.25rem',
+    width: '18px',
+    height: '18px',
     accentColor: '#10b981'
   },
+
   checkboxLabel: {
-    color: '#cbd5e1',
-    fontWeight: 500
+    fontSize: '0.9rem',
+    color: 'rgba(255, 255, 255, 0.8)',
+    cursor: 'pointer'
   },
+
   submitButton: {
-    width: '100%',
-    padding: '1.5rem 2rem',
-    borderRadius: '1rem',
-    fontWeight: 'bold',
-    fontSize: '1.25rem',
-    transition: 'all 0.3s ease',
+    background: 'linear-gradient(135deg, #10b981, #059669)',
     border: 'none',
+    borderRadius: '12px',
+    padding: '1rem 2rem',
+    color: 'white',
     cursor: 'pointer',
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
-    color: 'white'
+    transition: 'all 0.3s ease',
+    fontSize: '1rem',
+    fontWeight: '600',
+    marginTop: '1rem'
   },
+
   submitButtonDisabled: {
-    background: '#64748b',
+    background: 'rgba(255, 255, 255, 0.1)',
     cursor: 'not-allowed',
-    color: '#94a3b8'
+    opacity: 0.6
   },
+
   loadingContent: {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     gap: '0.75rem'
   },
+
   loadingSpinner: {
-    width: '1.5rem',
-    height: '1.5rem',
+    width: '20px',
+    height: '20px',
     border: '2px solid rgba(255, 255, 255, 0.3)',
     borderTop: '2px solid white',
     borderRadius: '50%',
     animation: 'spin 1s linear infinite'
   },
 
-  // Section Stats
-  statsContainer: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '2rem'
+  // Section Artistes
+  myProfileSection: {
+    marginBottom: '3rem'
   },
-  statsCard: {
-    background: 'rgba(30, 41, 59, 0.5)',
-    backdropFilter: 'blur(12px)',
-    padding: '2rem',
-    borderRadius: '1.5rem',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)'
+
+  subscriptionsSection: {
+    marginBottom: '3rem'
   },
-  statsGrid: {
-    display: 'grid',
-    gridTemplateColumns: '1fr',
-    '@media (min-width: 768px)': {
-      gridTemplateColumns: 'repeat(2, 1fr)'
-    },
-    '@media (min-width: 1024px)': {
-      gridTemplateColumns: 'repeat(4, 1fr)'
-    },
-    gap: '1.5rem',
+
+  allArtistsSection: {
     marginBottom: '2rem'
   },
-  statCard: {
-    background: 'rgba(30, 41, 59, 0.8)',
+
+  subsectionTitle: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.75rem',
+    fontSize: '1.5rem',
+    fontWeight: '600',
+    marginBottom: '1.5rem',
+    color: 'rgba(255, 255, 255, 0.9)'
+  },
+
+  subsectionIcon: {
+    fontSize: '1.5rem'
+  },
+
+  myProfileCard: {
+    background: 'rgba(16, 185, 129, 0.05)',
+    border: '1px solid rgba(16, 185, 129, 0.2)',
+    borderRadius: '16px',
+    padding: '2rem',
+    position: 'relative'
+  },
+
+  artistsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))',
+    gap: '1.5rem'
+  },
+
+  artistCard: {
+    background: 'rgba(255, 255, 255, 0.03)',
+    borderRadius: '16px',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
     padding: '1.5rem',
-    borderRadius: '1rem',
-    textAlign: 'center',
-    border: '1px solid rgba(71, 85, 105, 0.5)'
+    transition: 'all 0.3s ease',
+    cursor: 'pointer'
   },
-  statIcon: {
-    fontSize: '2.5rem',
-    marginBottom: '0.75rem',
-    animation: 'bounce 2s infinite'
+
+  artistHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: '1rem'
   },
-  statValue: {
-    fontSize: '1.875rem',
-    fontWeight: 900,
+
+  artistAvatar: {
+    width: '60px',
+    height: '60px',
+    borderRadius: '50%',
+    overflow: 'hidden',
+    border: '2px solid rgba(16, 185, 129, 0.3)'
+  },
+
+  artistAvatarImage: {
+    width: '100%',
+    height: '100%',
+    objectFit: 'cover'
+  },
+
+  myProfileBadge: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.25rem',
+    background: 'rgba(16, 185, 129, 0.2)',
+    border: '1px solid rgba(16, 185, 129, 0.4)',
+    borderRadius: '12px',
+    padding: '0.25rem 0.5rem',
+    fontSize: '0.7rem',
+    fontWeight: '600',
     color: '#10b981'
   },
-  statLabel: {
-    color: '#cbd5e1',
-    fontWeight: 500
-  },
-  topTracksSection: {
-    marginTop: '2rem'
-  },
-  topTracksTitle: {
-    fontSize: '1.5rem',
-    fontWeight: 'bold',
-    marginBottom: '1.5rem',
-    color: '#10b981',
+
+  subscribedBadge: {
     display: 'flex',
-    alignItems: 'center'
+    alignItems: 'center',
+    gap: '0.25rem',
+    background: 'rgba(251, 191, 36, 0.2)',
+    border: '1px solid rgba(251, 191, 36, 0.4)',
+    borderRadius: '12px',
+    padding: '0.25rem 0.5rem',
+    fontSize: '0.7rem',
+    fontWeight: '600',
+    color: '#fbbf24'
   },
+
+  artistInfo: {
+    marginBottom: '1rem'
+  },
+
+  artistName: {
+    fontSize: '1.2rem',
+    fontWeight: '600',
+    marginBottom: '0.25rem',
+    color: 'white'
+  },
+
+  artistGenre: {
+    color: 'rgba(255, 255, 255, 0.7)',
+    fontSize: '0.9rem',
+    marginBottom: '0.5rem'
+  },
+
+  artistBio: {
+    color: 'rgba(255, 255, 255, 0.6)',
+    fontSize: '0.8rem',
+    lineHeight: '1.4',
+    marginBottom: '0.5rem'
+  },
+
+  artistLocation: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.25rem',
+    color: 'rgba(255, 255, 255, 0.6)',
+    fontSize: '0.8rem'
+  },
+
+  artistStats: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, 1fr)',
+    gap: '1rem',
+    marginBottom: '1rem',
+    padding: '1rem',
+    background: 'rgba(255, 255, 255, 0.02)',
+    borderRadius: '8px'
+  },
+
+  artistStat: {
+    textAlign: 'center'
+  },
+
+  artistStatValue: {
+    display: 'block',
+    fontSize: '1.2rem',
+    fontWeight: '600',
+    color: '#10b981'
+  },
+
+  artistStatLabel: {
+    fontSize: '0.7rem',
+    color: 'rgba(255, 255, 255, 0.6)',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px'
+  },
+
+  artistSocial: {
+    display: 'flex',
+    gap: '0.5rem',
+    marginBottom: '1rem'
+  },
+
+  socialLink: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '32px',
+    height: '32px',
+    background: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: '8px',
+    fontSize: '1rem',
+    textDecoration: 'none',
+    transition: 'all 0.3s ease'
+  },
+
+  artistActions: {
+    display: 'flex',
+    gap: '0.5rem'
+  },
+
+  subscribeButton: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.5rem',
+    padding: '0.5rem 1rem',
+    background: 'linear-gradient(135deg, #10b981, #059669)',
+    border: 'none',
+    borderRadius: '8px',
+    color: 'white',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.8rem',
+    fontWeight: '500',
+    flex: 1
+  },
+
+  unsubscribeButton: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.5rem',
+    padding: '0.5rem 1rem',
+    background: 'rgba(239, 68, 68, 0.1)',
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+    borderRadius: '8px',
+    color: '#ef4444',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.8rem',
+    fontWeight: '500',
+    flex: 1
+  },
+
+  editProfileButton: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.5rem',
+    padding: '0.5rem 1rem',
+    background: 'rgba(59, 130, 246, 0.1)',
+    border: '1px solid rgba(59, 130, 246, 0.3)',
+    borderRadius: '8px',
+    color: '#3b82f6',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.8rem',
+    fontWeight: '500',
+    flex: 1
+  },
+
+  // Modal de profil
+  modalOverlay: {
+    position: 'fixed',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    background: 'rgba(0, 0, 0, 0.8)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 2000,
+    padding: '2rem'
+  },
+
+  modalContent: {
+    background: 'linear-gradient(135deg, #1e293b, #334155)',
+    borderRadius: '16px',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    width: '100%',
+    maxWidth: '600px',
+    maxHeight: '90vh',
+    overflow: 'hidden',
+    display: 'flex',
+    flexDirection: 'column'
+  },
+
+  modalHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '1.5rem',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.1)'
+  },
+
+  modalTitle: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.75rem',
+    fontSize: '1.3rem',
+    fontWeight: '600',
+    color: 'white',
+    margin: 0
+  },
+
+  modalIcon: {
+    fontSize: '1.5rem'
+  },
+
+  modalCloseButton: {
+    background: 'none',
+    border: 'none',
+    color: 'rgba(255, 255, 255, 0.6)',
+    fontSize: '1.5rem',
+    cursor: 'pointer',
+    padding: '0.5rem',
+    borderRadius: '8px',
+    transition: 'all 0.3s ease'
+  },
+
+  profileForm: {
+    padding: '1.5rem',
+    overflowY: 'auto',
+    flex: 1
+  },
+
+  profileImageSection: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '1.5rem',
+    marginBottom: '2rem',
+    padding: '1.5rem',
+    background: 'rgba(255, 255, 255, 0.02)',
+    borderRadius: '12px',
+    border: '1px solid rgba(255, 255, 255, 0.05)'
+  },
+
+  currentProfileImage: {
+    flexShrink: 0
+  },
+
+  currentAvatar: {
+    width: '80px',
+    height: '80px',
+    borderRadius: '50%',
+    border: '3px solid rgba(16, 185, 129, 0.3)'
+  },
+
+  profileImageUpload: {
+    flex: 1
+  },
+
+  profileImageLabel: {
+    display: 'inline-block',
+    padding: '0.75rem 1rem',
+    background: 'rgba(59, 130, 246, 0.1)',
+    border: '1px solid rgba(59, 130, 246, 0.3)',
+    borderRadius: '8px',
+    color: '#3b82f6',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.9rem',
+    fontWeight: '500'
+  },
+
+  hiddenFileInput: {
+    display: 'none'
+  },
+
+  newImagePreview: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.5rem',
+    marginTop: '0.5rem',
+    padding: '0.5rem',
+    background: 'rgba(16, 185, 129, 0.1)',
+    borderRadius: '6px',
+    border: '1px solid rgba(16, 185, 129, 0.3)'
+  },
+
+  profileSection: {
+    marginBottom: '2rem'
+  },
+
+  profileSectionTitle: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.5rem',
+    fontSize: '1.1rem',
+    fontWeight: '600',
+    marginBottom: '1rem',
+    color: 'rgba(255, 255, 255, 0.9)'
+  },
+
+  profileSectionIcon: {
+    fontSize: '1.2rem'
+  },
+
+  profileGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))',
+    gap: '1rem'
+  },
+
+  socialGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+    gap: '1rem'
+  },
+
+  profileActions: {
+    display: 'flex',
+    gap: '1rem',
+    justifyContent: 'flex-end',
+    paddingTop: '1rem',
+    borderTop: '1px solid rgba(255, 255, 255, 0.1)'
+  },
+
+  cancelButton: {
+    padding: '0.75rem 1.5rem',
+    background: 'transparent',
+    border: '1px solid rgba(255, 255, 255, 0.2)',
+    borderRadius: '8px',
+    color: 'rgba(255, 255, 255, 0.8)',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.9rem',
+    fontWeight: '500'
+  },
+
+  saveButton: {
+    padding: '0.75rem 1.5rem',
+    background: 'linear-gradient(135deg, #10b981, #059669)',
+    border: 'none',
+    borderRadius: '8px',
+    color: 'white',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '0.9rem',
+    fontWeight: '600'
+  },
+
+  saveButtonDisabled: {
+    background: 'rgba(255, 255, 255, 0.1)',
+    cursor: 'not-allowed',
+    opacity: 0.6
+  },
+
+  // Section Stats
+  statsContainer: {
+    maxWidth: '1000px',
+    margin: '0 auto'
+  },
+
+  statsCard: {
+    background: 'rgba(255, 255, 255, 0.02)',
+    borderRadius: '16px',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
+    padding: '2rem'
+  },
+
+  statsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+    gap: '1.5rem',
+    marginBottom: '3rem'
+  },
+
+  statCard: {
+    background: 'rgba(255, 255, 255, 0.03)',
+    borderRadius: '12px',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
+    padding: '1.5rem',
+    textAlign: 'center',
+    transition: 'all 0.3s ease'
+  },
+
+  statIcon: {
+    fontSize: '2rem',
+    marginBottom: '0.5rem'
+  },
+
+  statValue: {
+    fontSize: '2rem',
+    fontWeight: 'bold',
+    color: '#10b981',
+    marginBottom: '0.25rem'
+  },
+
+  statLabel: {
+    color: 'rgba(255, 255, 255, 0.7)',
+    fontSize: '0.9rem',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px'
+  },
+
+  topTracksSection: {
+    background: 'rgba(255, 255, 255, 0.02)',
+    borderRadius: '12px',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
+    padding: '1.5rem'
+  },
+
+  topTracksTitle: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.75rem',
+    fontSize: '1.3rem',
+    fontWeight: '600',
+    marginBottom: '1.5rem',
+    color: 'rgba(255, 255, 255, 0.9)'
+  },
+
   topTracksIcon: {
-    marginRight: '0.75rem'
+    fontSize: '1.5rem'
   },
+
   topTracksList: {
     display: 'flex',
     flexDirection: 'column',
-    gap: '1rem'
+    gap: '0.75rem'
   },
+
   topTrackItem: {
-    background: 'rgba(30, 41, 59, 0.8)',
-    padding: '1rem',
-    borderRadius: '1rem',
-    border: '1px solid rgba(71, 85, 105, 0.5)',
-    cursor: 'pointer',
-    transition: 'all 0.3s ease',
     display: 'flex',
     alignItems: 'center',
-    gap: '1rem'
+    gap: '1rem',
+    padding: '1rem',
+    background: 'rgba(255, 255, 255, 0.02)',
+    borderRadius: '12px',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease'
   },
+
   topTrackRank: {
     flexShrink: 0
   },
+
   rankBadge: {
-    width: '3rem',
-    height: '3rem',
+    width: '32px',
+    height: '32px',
     borderRadius: '50%',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    color: 'white',
+    fontSize: '0.9rem',
     fontWeight: 'bold',
-    fontSize: '1.125rem',
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)'
+    color: 'white'
   },
+
   topTrackCover: {
-    width: '3.5rem',
-    height: '3.5rem',
-    background: '#64748b',
-    borderRadius: '0.75rem',
-    overflow: 'hidden',
     flexShrink: 0,
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)'
+    width: '48px',
+    height: '48px',
+    borderRadius: '8px',
+    overflow: 'hidden'
   },
+
   topTrackImage: {
     width: '100%',
     height: '100%',
     objectFit: 'cover'
   },
+
   topTrackPlaceholder: {
     width: '100%',
     height: '100%',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    color: '#64748b',
-    fontSize: '1.25rem'
+    background: 'rgba(16, 185, 129, 0.1)',
+    color: 'rgba(16, 185, 129, 0.5)',
+    fontSize: '1.2rem'
   },
+
   topTrackInfo: {
     flex: 1,
     minWidth: 0
   },
+
   topTrackTitle: {
-    fontWeight: 'bold',
+    fontSize: '0.95rem',
+    fontWeight: '600',
     color: 'white',
+    marginBottom: '0.25rem',
     overflow: 'hidden',
     textOverflow: 'ellipsis',
     whiteSpace: 'nowrap'
   },
+
   topTrackArtist: {
-    color: '#94a3b8',
-    fontSize: '0.875rem',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap'
+    fontSize: '0.8rem',
+    color: 'rgba(255, 255, 255, 0.7)',
+    marginBottom: '0.25rem'
   },
+
   topTrackAlbum: {
-    color: '#64748b',
-    fontSize: '0.75rem',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap'
+    fontSize: '0.7rem',
+    color: 'rgba(255, 255, 255, 0.5)'
   },
+
   topTrackStats: {
-    textAlign: 'right'
+    textAlign: 'center',
+    marginRight: '1rem'
   },
+
   topTrackPlays: {
-    color: '#10b981',
-    fontWeight: 'bold',
-    fontSize: '1.125rem'
+    fontSize: '1.1rem',
+    fontWeight: '600',
+    color: '#10b981'
   },
+
   topTrackPlaysLabel: {
-    color: '#94a3b8',
-    fontSize: '0.75rem'
+    fontSize: '0.7rem',
+    color: 'rgba(255, 255, 255, 0.6)',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px'
   },
+
   topTrackPlayButton: {
-    width: '2.5rem',
-    height: '2.5rem',
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
+    flexShrink: 0,
+    width: '40px',
+    height: '40px',
     borderRadius: '50%',
+    background: 'linear-gradient(135deg, #10b981, #059669)',
+    border: 'none',
+    color: 'white',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    color: 'white',
-    border: 'none',
-    cursor: 'pointer',
-    transition: 'all 0.3s ease',
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)'
+    fontSize: '1rem'
   },
 
-  // Lecteur audio amélioré
-  player: {
+  // Lecteur audio
+  audioPlayer: {
     position: 'fixed',
     bottom: 0,
     left: 0,
     right: 0,
-    background: 'rgba(15, 23, 42, 0.98)',
-    backdropFilter: 'blur(12px)',
-    borderTop: '1px solid rgba(71, 85, 105, 0.5)',
-    zIndex: 50,
-    boxShadow: '0 -25px 50px -12px rgba(0, 0, 0, 0.25)'
+    background: 'rgba(15, 23, 42, 0.95)',
+    backdropFilter: 'blur(20px)',
+    borderTop: '1px solid rgba(255, 255, 255, 0.1)',
+    zIndex: 1000,
+    padding: '1rem 2rem'
   },
+
   playerContent: {
-    maxWidth: '80rem',
-    margin: '0 auto',
-    padding: '0 1rem'
-  },
-  progressSection: {
-    paddingTop: '0.5rem'
-  },
-  progressContainer: {
-    display: 'flex',
+    display: 'grid',
+    gridTemplateColumns: '1fr 2fr 1fr',
+    gap: '2rem',
     alignItems: 'center',
-    gap: '1rem'
+    maxWidth: '1400px',
+    margin: '0 auto'
   },
-  timeLabel: {
-    width: '3rem',
-    textAlign: 'center',
-    fontFamily: 'monospace',
-    fontSize: '0.75rem',
-    color: '#94a3b8'
-  },
-  playerMain: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingTop: '1rem',
-    paddingBottom: '1rem'
-  },
+
   playerTrackInfo: {
     display: 'flex',
     alignItems: 'center',
     gap: '1rem',
-    flex: 1,
     minWidth: 0
   },
-  playerTrackCover: {
-    width: '3.5rem',
-    height: '3.5rem',
-    background: '#64748b',
-    borderRadius: '0.75rem',
-    overflow: 'hidden',
+
+  playerCover: {
     flexShrink: 0,
-    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)'
+    width: '56px',
+    height: '56px',
+    borderRadius: '8px',
+    overflow: 'hidden'
   },
+
   playerCoverImage: {
     width: '100%',
     height: '100%',
     objectFit: 'cover'
   },
+
   playerCoverPlaceholder: {
     width: '100%',
     height: '100%',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    color: '#64748b',
-    fontSize: '1.25rem'
+    background: 'rgba(16, 185, 129, 0.1)',
+    color: 'rgba(16, 185, 129, 0.5)',
+    fontSize: '1.5rem'
   },
-  playerTrackDetails: {
+
+  playerInfo: {
     minWidth: 0,
     flex: 1
   },
-  playerTrackTitle: {
-    fontWeight: 'bold',
+
+  playerTitle: {
+    fontSize: '0.95rem',
+    fontWeight: '600',
     color: 'white',
+    marginBottom: '0.25rem',
     overflow: 'hidden',
     textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-    margin: 0
+    whiteSpace: 'nowrap'
   },
-  playerTrackArtist: {
-    color: '#94a3b8',
-    fontSize: '0.875rem',
+
+  playerArtist: {
+    fontSize: '0.8rem',
+    color: 'rgba(255, 255, 255, 0.7)',
     overflow: 'hidden',
     textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-    margin: 0
+    whiteSpace: 'nowrap'
   },
-  playerTrackAlbum: {
-    color: '#64748b',
-    fontSize: '0.75rem',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-    margin: 0
-  },
+
   playerControls: {
     display: 'flex',
-    alignItems: 'center',
-    gap: '1rem'
+    flexDirection: 'column',
+    gap: '0.75rem',
+    alignItems: 'center'
   },
-  controlButton: {
-    width: '2.5rem',
-    height: '2.5rem',
-    color: '#94a3b8',
-    borderRadius: '50%',
+
+  playerButtons: {
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'center',
-    transition: 'all 0.3s ease',
-    border: 'none',
+    gap: '0.5rem'
+  },
+
+  playerButton: {
     background: 'transparent',
-    cursor: 'pointer'
-  },
-  controlButtonActive: {
-    color: '#10b981',
-    background: 'rgba(16, 185, 129, 0.3)'
-  },
-  playControlButton: {
-    width: '3.5rem',
-    height: '3.5rem',
-    background: 'linear-gradient(to right, #10b981, #3b82f6)',
+    border: 'none',
+    color: 'rgba(255, 255, 255, 0.7)',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '1.2rem',
+    padding: '0.5rem',
     borderRadius: '50%',
+    width: '40px',
+    height: '40px',
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'center',
-    fontSize: '1.25rem',
-    boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)',
-    transform: 'scale(1)',
-    transition: 'all 0.3s ease',
+    justifyContent: 'center'
+  },
+
+  playerButtonActive: {
+    color: '#10b981',
+    background: 'rgba(16, 185, 129, 0.1)'
+  },
+
+  playerPlayButton: {
+    background: 'linear-gradient(135deg, #10b981, #059669)',
     border: 'none',
     color: 'white',
-    cursor: 'pointer'
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    fontSize: '1.5rem',
+    padding: '0.75rem',
+    borderRadius: '50%',
+    width: '56px',
+    height: '56px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    boxShadow: '0 4px 12px rgba(16, 185, 129, 0.3)'
   },
-  playerActions: {
+
+  progressContainer: {
     display: 'flex',
     alignItems: 'center',
     gap: '1rem',
-    flex: 1,
-    justifyContent: 'flex-end'
+    width: '100%'
   },
-  likeButton: {
-    width: '2.5rem',
-    height: '2.5rem',
-    color: '#f87171',
-    borderRadius: '50%',
+
+  timeLabel: {
+    fontSize: '0.75rem',
+    color: 'rgba(255, 255, 255, 0.6)',
+    fontWeight: '500',
+    minWidth: '40px',
+    textAlign: 'center'
+  },
+
+  playerSecondary: {
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'center',
-    transition: 'all 0.3s ease',
-    border: 'none',
-    background: 'transparent',
-    cursor: 'pointer'
+    justifyContent: 'flex-end',
+    gap: '1rem'
   },
-  volumeControl: {
+
+  volumeContainer: {
     display: 'flex',
     alignItems: 'center',
-    gap: '0.75rem'
+    gap: '0.5rem'
   },
-  volumeIcon: {
-    color: '#94a3b8'
-  },
+
   volumeSlider: {
-    width: '5rem',
-    height: '0.25rem',
-    background: 'rgba(71, 85, 105, 0.5)',
-    borderRadius: '0.125rem',
+    width: '80px',
+    height: '4px',
+    background: 'rgba(255, 255, 255, 0.2)',
+    borderRadius: '2px',
     outline: 'none',
     cursor: 'pointer',
     accentColor: '#10b981'
-  },
-  volumeLabel: {
-    color: '#94a3b8',
-    fontSize: '0.75rem',
-    width: '2rem'
   }
 };
 
-// Ajout des animations CSS via une balise style
+// Ajout des animations CSS
 const styleSheet = document.createElement('style');
 styleSheet.textContent = `
-  @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(20px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  
-  @keyframes slideInLeft {
-    from { opacity: 0; transform: translateX(-30px); }
-    to { opacity: 1; transform: translateX(0); }
-  }
-  
-  @keyframes slideInRight {
-    from { opacity: 0; transform: translateX(30px); }
-    to { opacity: 1; transform: translateX(0); }
-  }
-  
-  @keyframes scaleIn {
-    from { opacity: 0; transform: scale(0.95); }
-    to { opacity: 1; transform: scale(1); }
-  }
-  
-  @keyframes bounce {
-    0%, 20%, 53%, 80%, 100% { transform: translateY(0); }
-    40%, 43% { transform: translateY(-30px); }
-    70% { transform: translateY(-15px); }
-    90% { transform: translateY(-4px); }
-  }
-  
   @keyframes float {
-    0%, 100% { transform: translateY(0px); }
-    50% { transform: translateY(-20px); }
+    0%, 100% { transform: translateY(0px) rotate(0deg); opacity: 0.7; }
+    50% { transform: translateY(-20px) rotate(180deg); opacity: 1; }
   }
-  
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-  }
-  
+
   @keyframes spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
   }
-  
-  /* Hover effects */
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.8); }
+  }
+
+  .track-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+  }
+
   .track-card:hover .cover-overlay {
     opacity: 1;
   }
-  
-  .track-card:hover {
-    transform: translateY(-5px);
-    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-  }
-  
-  .play-button:hover {
+
+  .track-card:hover .play-button {
     transform: scale(1.1);
   }
-  
-  .control-button:hover {
-    background: rgba(71, 85, 105, 0.5);
-    color: white;
+
+  .artist-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
   }
-  
-  .play-control-button:hover {
-    transform: scale(1.05);
-    box-shadow: 0 25px 50px -12px rgba(16, 185, 129, 0.25);
-  }
-  
+
   .top-track-item:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+    background: rgba(255, 255, 255, 0.05);
+    transform: translateX(4px);
   }
-  
-  .top-track-play-button:hover {
+
+  .top-track-item:hover .top-track-play-button {
     transform: scale(1.1);
   }
-  
-  /* Focus styles for accessibility */
-  input:focus, select:focus, textarea:focus, button:focus {
-    outline: 2px solid #10b981;
-    outline-offset: 2px;
+
+  input:focus, select:focus, textarea:focus {
+    border-color: rgba(16, 185, 129, 0.5);
+    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.1);
   }
-  
-  /* Scrollbar styling */
-  ::-webkit-scrollbar {
-    width: 8px;
+
+  button:hover:not(:disabled) {
+    transform: translateY(-1px);
   }
-  
-  ::-webkit-scrollbar-track {
-    background: rgba(71, 85, 105, 0.3);
+
+  button:active:not(:disabled) {
+    transform: translateY(0);
   }
-  
-  ::-webkit-scrollbar-thumb {
-    background: linear-gradient(to bottom, #10b981, #3b82f6);
-    border-radius: 4px;
-  }
-  
-  ::-webkit-scrollbar-thumb:hover {
-    background: linear-gradient(to bottom, #059669, #2563eb);
+
+  @media (max-width: 768px) {
+    .playerContent {
+      grid-template-columns: 1fr;
+      gap: 1rem;
+      text-align: center;
+    }
+    
+    .tracksGrid {
+      grid-template-columns: 1fr;
+    }
+    
+    .artistsGrid {
+      grid-template-columns: 1fr;
+    }
+    
+    .formGrid {
+      grid-template-columns: 1fr;
+    }
+    
+    .statsGrid {
+      grid-template-columns: repeat(2, 1fr);
+    }
   }
 `;
 
